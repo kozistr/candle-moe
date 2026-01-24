@@ -28,7 +28,18 @@ bindgen_cuda = "0.1.5"
 anyhow = { version = "1" }
 candle-nn = { version = "0.8", features = ["cuda"] }
 candle-transformers = { version = "0.8" }
+criterion = "0.5"
 
 [profile.release]
 lto = "fat"
 codegen-units = 1
+
+# [[bench]]
+# name = "bench_topk_softmax"
+# harness = false
+# path = "benches/bench_topk_softmax.rs"
+
+[[bench]]
+name = "bench_fused_moe"
+harness = false
+path = "benches/bench_fused_moe.rs"
