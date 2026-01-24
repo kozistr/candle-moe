@@ -12,8 +12,7 @@ unsafe extern "C" {
         topk: c_int,
     );
 
-    // Fused MoE forward pass
-    pub(crate) fn fused_moe_forward(
+    pub(crate) fn fused_moe(
         input: *const c_void,
         gate_weights: *const c_void,
         up_weights: *const c_void,
@@ -31,7 +30,7 @@ unsafe extern "C" {
     );
 
     #[allow(dead_code)]
-    pub(crate) fn fused_moe_forward_optimized(
+    pub(crate) fn optimized_fused_moe(
         input: *const c_void,
         gate_weights: *const c_void,
         up_weights: *const c_void,

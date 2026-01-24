@@ -9,9 +9,15 @@ categories = ["science"]
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 
+[features]
+default = ["cuda-11"]
+# Use cuda-12 for candle 0.9+ with cudarc 0.16+ (new API)
+# Use cuda-11 for older candle versions (pre-0.9) with older cudarc API
+cuda-12 = []
+cuda-11 = []
+
 [dependencies]
-candle = { version = "0.8", package = "candle-core", features = ["cuda"] }
-cudarc = { version = "0.13.3", default-features = false }
+candle = { version = ">=0.1", package = "candle-core", features = ["cuda"] }
 half = { version = "2.3.1", features = ["num-traits"] }
 
 [build-dependencies]

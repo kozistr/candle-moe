@@ -101,6 +101,7 @@ fn fused_moe() -> Result<()> {
     let hidden_states =
         Tensor::randn(0.0, 1.0, (seq_len, n_embed), &device)?.to_dtype(DType::F32)?;
     let weights = Tensor::randn(0.0, 1.0, (seq_len, num_experts), &device)?.to_dtype(DType::F32)?;
+    let fused_moe_output = Tensor::zeros_like(&hidden_states)?;
 
     let (scores, indices) = forward_moe_router(&weights, seq_len, top_k, &device)?;
 
@@ -109,16 +110,20 @@ fn fused_moe() -> Result<()> {
     let up_weights =
         Tensor::randn(0.0, 1.0, (num_experts, n_embed, n_inner), &device)?.to_dtype(DType::F32)?;
 
-    let fused_moe =
-        candle_moe::FusedMoeForward::new(gate_weights.dim(0)?, top_k, candle_moe::Activation::Silu);
+    let fused_moe = candle_moe::FusedMoE {
+        num_experts: gate_weights.dim(0)?,
+        num_selected_experts: top_k,
+        activation: candle_moe::Activation::Silu,
+    };
 
-    let fused_moe_output = fused_moe.forward(
+    fused_moe.forward(
         &hidden_states,
         &gate_weights,
         &up_weights,
         None,
         &scores,
         &indices,
+        &fused_moe_output,
         1_u32,
     )?;
 

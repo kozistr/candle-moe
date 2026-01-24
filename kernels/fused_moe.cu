@@ -186,7 +186,7 @@ __global__ void qwen3_fused_moe_kernel(
 
 // Optimized fused MoE kernel with tiling and better memory access patterns
 template<typename T, int TILE_M, int TILE_N, int TILE_K>
-__global__ void fused_moe_kernel_optimized(
+__global__ void optimized_fused_moe_kernel(
     const T* __restrict__ input,              // [num_tokens, hidden_dim]
     const T* __restrict__ gate_weights,       // [num_experts, hidden_dim, intermediate_dim]
     const T* __restrict__ up_weights,         // [num_experts, hidden_dim, intermediate_dim]
@@ -440,7 +440,7 @@ __global__ void prepare_sorted_pairs(
     }
 }
 
-#define CALL_NOMIC_FUSED_MOE_FORWARD(T)                                         \
+#define CALL_NOMIC_FUSED_MOE(T)                                                 \
   nomic_fused_moe_kernel<T><<<num_tokens, threads, shared_mem_size, stream>>>(  \
     reinterpret_cast<T*>(input),                                                \
     reinterpret_cast<T*>(gate_weights),                                         \
@@ -455,7 +455,7 @@ __global__ void prepare_sorted_pairs(
     activation_type                                                             \
   );
 
-#define CALL_QWEN3_FUSED_MOE_FORWARD(T)                                         \
+#define CALL_QWEN3_FUSED_MOE(T)                                                 \
   qwen3_fused_moe_kernel<T><<<num_tokens, threads, shared_mem_size, stream>>>(  \
     reinterpret_cast<T*>(input),                                                \
     reinterpret_cast<T*>(gate_weights),                                         \
@@ -473,49 +473,47 @@ __global__ void prepare_sorted_pairs(
 
 // C interface for optimized fused MoE
 extern "C" {
+    void fused_moe(
+        void* input,
+        void* gate_weights,
+        void* up_weights,
+        void* down_weights,
+        float* routing_weights,
+        uint32_t* expert_indices,
+        void* output,
+        int num_tokens,
+        int hidden_dim,
+        int intermediate_dim,
+        int num_selected_experts,
+        int activation_type,
+        uint32_t moe_type,       // 0 => qwen3, 1 => nomic
+        uint32_t dtype           // 0 => f16; 1 => bf16; 2 => f32
+    ) {
+        const cudaStream_t stream = 0;
+        const int threads = 256;
 
-void fused_moe_forward(
-    void* input,
-    void* gate_weights,
-    void* up_weights,
-    void* down_weights,
-    float* routing_weights,
-    uint32_t* expert_indices,
-    void* output,
-    int num_tokens,
-    int hidden_dim,
-    int intermediate_dim,
-    int num_selected_experts,
-    int activation_type,
-    uint32_t moe_type,       // 0 => qwen3, 1 => nomic
-    uint32_t dtype           // 0 => f16; 1 => bf16; 2 => f32
-) {
-    const cudaStream_t stream = 0;
-    const int threads = 256;
-
-    if (moe_type == 0) {
-        if (dtype == 0) {
-            int shared_mem_size = (hidden_dim + intermediate_dim) * sizeof(half);
-            CALL_QWEN3_FUSED_MOE_FORWARD(half);
-        } else if (dtype == 1) {
-            int shared_mem_size = (hidden_dim + intermediate_dim) * sizeof(__nv_bfloat16);
-            CALL_QWEN3_FUSED_MOE_FORWARD(__nv_bfloat16);
-        } else {
-            int shared_mem_size = (hidden_dim + intermediate_dim) * sizeof(float);
-            CALL_QWEN3_FUSED_MOE_FORWARD(float);
-        }
-    } else if (moe_type == 1) {
-        if (dtype == 0) {
-            int shared_mem_size = (hidden_dim + intermediate_dim) * sizeof(half);
-            CALL_NOMIC_FUSED_MOE_FORWARD(half);
-        } else if (dtype == 1) {
-            int shared_mem_size = (hidden_dim + intermediate_dim) * sizeof(__nv_bfloat16);
-            CALL_NOMIC_FUSED_MOE_FORWARD(__nv_bfloat16);
-        } else {
-            int shared_mem_size = (hidden_dim + intermediate_dim) * sizeof(float);
-            CALL_NOMIC_FUSED_MOE_FORWARD(float);
+        if (moe_type == 0) {
+            if (dtype == 0) {
+                int shared_mem_size = (hidden_dim + intermediate_dim) * sizeof(half);
+                CALL_QWEN3_FUSED_MOE(half);
+            } else if (dtype == 1) {
+                int shared_mem_size = (hidden_dim + intermediate_dim) * sizeof(__nv_bfloat16);
+                CALL_QWEN3_FUSED_MOE(__nv_bfloat16);
+            } else {
+                int shared_mem_size = (hidden_dim + intermediate_dim) * sizeof(float);
+                CALL_QWEN3_FUSED_MOE(float);
+            }
+        } else if (moe_type == 1) {
+            if (dtype == 0) {
+                int shared_mem_size = (hidden_dim + intermediate_dim) * sizeof(half);
+                CALL_NOMIC_FUSED_MOE(half);
+            } else if (dtype == 1) {
+                int shared_mem_size = (hidden_dim + intermediate_dim) * sizeof(__nv_bfloat16);
+                CALL_NOMIC_FUSED_MOE(__nv_bfloat16);
+            } else {
+                int shared_mem_size = (hidden_dim + intermediate_dim) * sizeof(float);
+                CALL_NOMIC_FUSED_MOE(float);
+            }
         }
     }
-}
-
 } // extern "C"
