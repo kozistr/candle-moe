@@ -29,8 +29,7 @@ unsafe extern "C" {
         dtype: u32,
     );
 
-    #[allow(dead_code)]
-    pub(crate) fn optimized_fused_moe(
+    pub(crate) fn fused_moe_auto(
         input: *const c_void,
         gate_weights: *const c_void,
         up_weights: *const c_void,
@@ -41,8 +40,15 @@ unsafe extern "C" {
         num_tokens: i32,
         hidden_dim: i32,
         intermediate_dim: i32,
-        num_experts: i32,
+        num_selected_experts: i32,
         activation_type: i32,
+        moe_type: u32,
         dtype: u32,
+        // workspace buffers
+        expert_counts: *mut c_int,
+        expert_offsets: *mut c_int,
+        token_ids: *mut c_int,
+        select_ids: *mut c_int,
+        counters: *mut c_int,
     );
 }

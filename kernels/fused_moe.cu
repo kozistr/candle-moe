@@ -1,519 +1,1271 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
-
 #include <cstdint>
-#include <stdio.h>
 #include <algorithm>
 
-// Block sizes for tiled matrix multiplication
-#define BLOCK_M 64
-#define BLOCK_N 64
-#define BLOCK_K 32
+// ============================================================================
+// Constants
+// ============================================================================
 #define WARP_SIZE 32
+#define BLOCK_SIZE 256
+#define SMEM_PAD 1
 
-// Structure to hold sorted token-expert pairs
-struct TokenExpertPair {
-    int token_idx;
-    int expert_idx;
-    float routing_weight;
-    int original_idx;  // Position in original routing weights
-};
+// ============================================================================
+// Device info cache
+// ============================================================================
+static int g_sm_count = 0;
+static int g_max_smem = 0;
 
-// Helper function for SiLU activation
-__device__ __forceinline__ float silu(float x) {
-    return x / (1.0f + expf(-x));
+inline void ensure_device_info() {
+    if (g_sm_count > 0) return;
+    int device;
+    cudaGetDevice(&device);
+    cudaDeviceProp props;
+    cudaGetDeviceProperties(&props, device);
+    g_sm_count = props.multiProcessorCount;
+    cudaDeviceGetAttribute(&g_max_smem, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
+    if (g_max_smem == 0) g_max_smem = props.sharedMemPerBlock;
 }
 
-// Helper function for GELU activation
-__device__ __forceinline__ float gelu(float x) {
+// ============================================================================
+// Activation functions
+// ============================================================================
+__device__ __forceinline__ float activation_silu(float x) {
+    return x / (1.0f + __expf(-x));
+}
+
+__device__ __forceinline__ float activation_gelu(float x) {
     return 0.5f * x * (1.0f + tanhf(0.7978845608f * (x + 0.044715f * x * x * x)));
 }
 
+__device__ __forceinline__ float apply_activation(float x, int type) {
+    if (type == 0) return activation_silu(x);
+    if (type == 1) return activation_gelu(x);
+    return fmaxf(0.0f, x);  // ReLU
+}
+
+// ============================================================================
+// Type conversion helpers
+// ============================================================================
+template<typename T> __device__ __forceinline__ float to_float(T val);
+template<> __device__ __forceinline__ float to_float(float val) { return val; }
+template<> __device__ __forceinline__ float to_float(half val) { return __half2float(val); }
+template<> __device__ __forceinline__ float to_float(__nv_bfloat16 val) { return __bfloat162float(val); }
+
+template<typename T> __device__ __forceinline__ T from_float(float val);
+template<> __device__ __forceinline__ float from_float(float val) { return val; }
+template<> __device__ __forceinline__ half from_float(float val) { return __float2half(val); }
+template<> __device__ __forceinline__ __nv_bfloat16 from_float(float val) { return __float2bfloat16(val); }
+
 template<typename T>
-__global__ void nomic_fused_moe_kernel(
-    const T* __restrict__ input,                  // [num_tokens, hidden_dim]
-    const T* __restrict__ gate_weights,           // [num_experts, hidden_dim, intermediate_dim]
-    const T* __restrict__ up_weights,             // [num_experts, hidden_dim, intermediate_dim]
-    const float* __restrict__ routing_weights,    // [num_tokens, num_selected_experts]
-    const uint32_t* __restrict__ expert_indices,  // [num_tokens, num_selected_experts]
-    T* __restrict__ output,                       // [num_tokens, hidden_dim]
-    int num_tokens,
+__device__ __forceinline__ float load_as_float(const T* ptr) {
+    return to_float(__ldg(ptr));
+}
+
+// ============================================================================
+// Atomic add - use native when available (SM60+ for half, SM80+ for bf16)
+// ============================================================================
+__device__ __forceinline__ void atomic_add(float* addr, float val) {
+    atomicAdd(addr, val);
+}
+
+#if __CUDA_ARCH__ >= 700
+// Native half atomicAdd available on Volta+ (SM70+)
+__device__ __forceinline__ void atomic_add(half* addr, float val) {
+    atomicAdd(addr, __float2half(val));
+}
+#else
+__device__ __forceinline__ void atomic_add(half* addr, float val) {
+    // Fallback CAS-based for older architectures
+    size_t addr_int = (size_t)addr;
+    unsigned int* base_addr = (unsigned int*)(addr_int & ~2ULL);
+    bool is_high = (addr_int & 2);
+
+    unsigned int old_val = *base_addr;
+    unsigned int assumed, new_val;
+
+    do {
+        assumed = old_val;
+        unsigned short lo = assumed & 0xFFFF;
+        unsigned short hi = (assumed >> 16) & 0xFFFF;
+
+        if (is_high) {
+            half h = *reinterpret_cast<half*>(&hi);
+            h = __float2half(__half2float(h) + val);
+            hi = *reinterpret_cast<unsigned short*>(&h);
+        } else {
+            half h = *reinterpret_cast<half*>(&lo);
+            h = __float2half(__half2float(h) + val);
+            lo = *reinterpret_cast<unsigned short*>(&h);
+        }
+
+        new_val = lo | (hi << 16);
+        old_val = atomicCAS(base_addr, assumed, new_val);
+    } while (assumed != old_val);
+}
+#endif
+
+#if __CUDA_ARCH__ >= 800
+// Native bfloat16 atomicAdd available on Ampere+ (SM80+)
+__device__ __forceinline__ void atomic_add(__nv_bfloat16* addr, float val) {
+    atomicAdd(addr, __float2bfloat16(val));
+}
+#else
+__device__ __forceinline__ void atomic_add(__nv_bfloat16* addr, float val) {
+    // Fallback CAS-based for older architectures
+    size_t addr_int = (size_t)addr;
+    unsigned int* base_addr = (unsigned int*)(addr_int & ~2ULL);
+    bool is_high = (addr_int & 2);
+
+    unsigned int old_val = *base_addr;
+    unsigned int assumed, new_val;
+
+    do {
+        assumed = old_val;
+        unsigned short lo = assumed & 0xFFFF;
+        unsigned short hi = (assumed >> 16) & 0xFFFF;
+
+        if (is_high) {
+            __nv_bfloat16 h = *reinterpret_cast<__nv_bfloat16*>(&hi);
+            h = __float2bfloat16(__bfloat162float(h) + val);
+            hi = *reinterpret_cast<unsigned short*>(&h);
+        } else {
+            __nv_bfloat16 h = *reinterpret_cast<__nv_bfloat16*>(&lo);
+            h = __float2bfloat16(__bfloat162float(h) + val);
+            lo = *reinterpret_cast<unsigned short*>(&h);
+        }
+
+        new_val = lo | (hi << 16);
+        old_val = atomicCAS(base_addr, assumed, new_val);
+    } while (assumed != old_val);
+}
+#endif
+
+// ============================================================================
+// Main MoE Kernel (Token-parallel) with register blocking
+// One block per token, processes all selected experts
+// ============================================================================
+#define OUTPUTS_PER_THREAD 4
+
+template<typename T, bool HAS_DOWN_WEIGHTS>
+__global__ __launch_bounds__(BLOCK_SIZE, 2)
+void moe_kernel(
+    const T* __restrict__ input,
+    const T* __restrict__ gate_weights,
+    const T* __restrict__ up_weights,
+    const T* __restrict__ down_weights,
+    const float* __restrict__ routing_weights,
+    const uint32_t* __restrict__ expert_indices,
+    T* __restrict__ output,
     int hidden_dim,
     int intermediate_dim,
     int num_selected_experts,
-    int activation_type             // 0: SiLU, 1: GELU, 2: ReLU
+    int activation_type
 ) {
-    extern __shared__ char shared_mem[];
-    T* shared_input = (T*)shared_mem;
-    T* shared_intermediate = shared_input + hidden_dim;
+    extern __shared__ float smem[];
+    float* smem_input = smem;
+    float* smem_inter = smem + hidden_dim + SMEM_PAD;
 
     const int token_idx = blockIdx.x;
     const int tid = threadIdx.x;
-    const int block_size = blockDim.x;
+    const int warp_id = tid / WARP_SIZE;
+    const int lane_id = tid % WARP_SIZE;
+    const int num_warps = BLOCK_SIZE / WARP_SIZE;
 
-    if (token_idx >= num_tokens) {
-        return;
-    }
-
-    for (int i = tid; i < hidden_dim; i += block_size) {
-        shared_input[i] = input[token_idx * hidden_dim + i];
-    }
-    __syncthreads();
-
-    for (int i = tid; i < hidden_dim; i += block_size) {
-        output[token_idx * hidden_dim + i] = T(0.0f);
+    // Load input to shared memory
+    const T* token_input = input + token_idx * hidden_dim;
+    for (int i = tid; i < hidden_dim; i += BLOCK_SIZE) {
+        smem_input[i] = load_as_float(token_input + i);
     }
     __syncthreads();
 
+    // Zero output
+    T* token_output = output + token_idx * hidden_dim;
+    for (int i = tid; i < hidden_dim; i += BLOCK_SIZE) {
+        token_output[i] = from_float<T>(0.0f);
+    }
+
+    // Compute stride for output parallelism
+    const int outputs_per_warp = OUTPUTS_PER_THREAD * WARP_SIZE;
+    const int outputs_per_iter = num_warps * outputs_per_warp;
+
+    // Process each selected expert
     for (int k = 0; k < num_selected_experts; k++) {
-        int expert_id = expert_indices[token_idx * num_selected_experts + k];
-        float routing_weight = routing_weights[token_idx * num_selected_experts + k];
+        const int expert_id = expert_indices[token_idx * num_selected_experts + k];
+        const float routing_weight = routing_weights[token_idx * num_selected_experts + k];
 
         const T* gate_w = gate_weights + expert_id * hidden_dim * intermediate_dim;
         const T* up_w = up_weights + expert_id * hidden_dim * intermediate_dim;
 
-        for (int i = tid; i < intermediate_dim; i += block_size) {
-            float gate_val = 0.0f;
+        // Phase 1: Gate (and Up when needed) projection with register blocking
+        if constexpr (HAS_DOWN_WEIGHTS) {
+            for (int base_i = warp_id * outputs_per_warp; base_i < intermediate_dim; base_i += outputs_per_iter) {
+                float gate_acc[OUTPUTS_PER_THREAD] = {0};
+                float up_acc[OUTPUTS_PER_THREAD] = {0};
 
-            for (int j = 0; j < hidden_dim; j++) {
-                float input_val = float(shared_input[j]);
-                gate_val += input_val * float(gate_w[j * intermediate_dim + i]);
+                #pragma unroll 4
+                for (int j = 0; j < hidden_dim; j++) {
+                    const float inp = smem_input[j];
+                    const int row_off = j * intermediate_dim;
+
+                    #pragma unroll
+                    for (int r = 0; r < OUTPUTS_PER_THREAD; r++) {
+                        const int i = base_i + lane_id + r * WARP_SIZE;
+                        if (i < intermediate_dim) {
+                            gate_acc[r] += inp * load_as_float(gate_w + row_off + i);
+                            up_acc[r] += inp * load_as_float(up_w + row_off + i);
+                        }
+                    }
+                }
+
+                #pragma unroll
+                for (int r = 0; r < OUTPUTS_PER_THREAD; r++) {
+                    const int i = base_i + lane_id + r * WARP_SIZE;
+                    if (i < intermediate_dim) {
+                        float activated = apply_activation(gate_acc[r], activation_type);
+                        smem_inter[i] = activated * up_acc[r];
+                    }
+                }
             }
+        } else {
+            for (int base_i = warp_id * outputs_per_warp; base_i < intermediate_dim; base_i += outputs_per_iter) {
+                float gate_acc[OUTPUTS_PER_THREAD] = {0};
 
-            if (activation_type == 0) {
-                gate_val = silu(gate_val);
-            } else if (activation_type == 1) {
-                gate_val = gelu(gate_val);
-            } else if (activation_type == 2) {
-                gate_val = fmaxf(0.0f, gate_val);
+                #pragma unroll 4
+                for (int j = 0; j < hidden_dim; j++) {
+                    const float inp = smem_input[j];
+                    const int row_off = j * intermediate_dim;
+
+                    #pragma unroll
+                    for (int r = 0; r < OUTPUTS_PER_THREAD; r++) {
+                        const int i = base_i + lane_id + r * WARP_SIZE;
+                        if (i < intermediate_dim) {
+                            gate_acc[r] += inp * load_as_float(gate_w + row_off + i);
+                        }
+                    }
+                }
+
+                #pragma unroll
+                for (int r = 0; r < OUTPUTS_PER_THREAD; r++) {
+                    const int i = base_i + lane_id + r * WARP_SIZE;
+                    if (i < intermediate_dim) {
+                        smem_inter[i] = apply_activation(gate_acc[r], activation_type);
+                    }
+                }
             }
-
-            shared_intermediate[i] = T(gate_val);
         }
         __syncthreads();
 
-        for (int i = tid; i < hidden_dim; i += block_size) {
-            float acc = 0.0f;
-            for (int j = 0; j < intermediate_dim; j++) {
-                acc += float(shared_intermediate[j]) * float(up_w[i * intermediate_dim + j]);
+        // Phase 2: Down projection with register blocking
+        if (HAS_DOWN_WEIGHTS) {
+            const T* down_w = down_weights + expert_id * intermediate_dim * hidden_dim;
+
+            for (int base_i = warp_id * outputs_per_warp; base_i < hidden_dim; base_i += outputs_per_iter) {
+                float acc[OUTPUTS_PER_THREAD] = {0};
+
+                #pragma unroll 4
+                for (int j = 0; j < intermediate_dim; j++) {
+                    const float inter = smem_inter[j];
+                    const int row_off = j * hidden_dim;
+
+                    #pragma unroll
+                    for (int r = 0; r < OUTPUTS_PER_THREAD; r++) {
+                        const int i = base_i + lane_id + r * WARP_SIZE;
+                        if (i < hidden_dim) {
+                            acc[r] += inter * load_as_float(down_w + row_off + i);
+                        }
+                    }
+                }
+
+                #pragma unroll
+                for (int r = 0; r < OUTPUTS_PER_THREAD; r++) {
+                    const int i = base_i + lane_id + r * WARP_SIZE;
+                    if (i < hidden_dim) {
+                        float current = to_float(token_output[i]);
+                        token_output[i] = from_float<T>(current + acc[r] * routing_weight);
+                    }
+                }
             }
-            output[token_idx * hidden_dim + i] += T(acc * routing_weight);
+        } else {
+            // Nomic: up_weights for output (different layout - need warp reduction)
+            for (int i = warp_id; i < hidden_dim; i += num_warps) {
+                float acc = 0.0f;
+
+                #pragma unroll 4
+                for (int j = lane_id; j < intermediate_dim; j += WARP_SIZE) {
+                    acc += smem_inter[j] * load_as_float(up_w + i * intermediate_dim + j);
+                }
+
+                // Warp reduction
+                #pragma unroll
+                for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
+                    acc += __shfl_xor_sync(0xffffffff, acc, offset);
+                }
+
+                if (lane_id == 0) {
+                    float current = to_float(token_output[i]);
+                    token_output[i] = from_float<T>(current + acc * routing_weight);
+                }
+            }
         }
         __syncthreads();
     }
 }
 
-template<typename T>
-__global__ void qwen3_fused_moe_kernel(
-    const T* __restrict__ input,                  // [num_tokens, hidden_dim]
-    const T* __restrict__ gate_weights,           // [num_experts, hidden_dim, intermediate_dim]
-    const T* __restrict__ up_weights,             // [num_experts, hidden_dim, intermediate_dim]
-    const T* __restrict__ down_weights,           // [num_experts, intermediate_dim, hidden_dim]
-    const float* __restrict__ routing_weights,    // [num_tokens, num_selected_experts]
-    const uint32_t* __restrict__ expert_indices,  // [num_tokens, num_selected_experts]
-    T* __restrict__ output,                       // [num_tokens, hidden_dim]
-    int num_tokens,
+// ============================================================================
+// Expert-Parallel Kernel (For large batches) with register blocking
+// One block per (token, expert) pair - better L2 cache utilization
+// ============================================================================
+template<typename T, bool HAS_DOWN_WEIGHTS>
+__global__ __launch_bounds__(BLOCK_SIZE, 4)
+void moe_expert_kernel(
+    const T* __restrict__ input,
+    const T* __restrict__ gate_weights,
+    const T* __restrict__ up_weights,
+    const T* __restrict__ down_weights,
+    const float* __restrict__ routing_weights,
+    const int* __restrict__ token_ids,
+    const int* __restrict__ select_ids,
+    T* __restrict__ output,
+    int expert_id,
+    int num_tokens_for_expert,
     int hidden_dim,
     int intermediate_dim,
     int num_selected_experts,
-    int activation_type             // 0: SiLU, 1: GELU, 2: ReLU
+    int activation_type
 ) {
-    extern __shared__ char shared_mem[];
-    T* shared_input = (T*)shared_mem;
-    T* shared_intermediate = shared_input + hidden_dim;
+    extern __shared__ float smem[];
+    float* smem_input = smem;
+    float* smem_inter = smem + hidden_dim + SMEM_PAD;
 
-    const int token_idx = blockIdx.x;
+    const int local_idx = blockIdx.x;
+    if (local_idx >= num_tokens_for_expert) return;
+
+    const int token_idx = token_ids[local_idx];
+    const int select_idx = select_ids[local_idx];
+    const float routing_weight = routing_weights[token_idx * num_selected_experts + select_idx];
+
     const int tid = threadIdx.x;
-    const int block_size = blockDim.x;
+    const int warp_id = tid / WARP_SIZE;
+    const int lane_id = tid % WARP_SIZE;
+    const int num_warps = BLOCK_SIZE / WARP_SIZE;
 
-    if (token_idx >= num_tokens) {
-        return;
-    }
-
-    for (int i = tid; i < hidden_dim; i += block_size) {
-        shared_input[i] = input[token_idx * hidden_dim + i];
-    }
-    __syncthreads();
-
-    for (int i = tid; i < hidden_dim; i += block_size) {
-        output[token_idx * hidden_dim + i] = T(0.0f);
+    // Load input
+    const T* token_input = input + token_idx * hidden_dim;
+    for (int i = tid; i < hidden_dim; i += BLOCK_SIZE) {
+        smem_input[i] = load_as_float(token_input + i);
     }
     __syncthreads();
 
-    for (int k = 0; k < num_selected_experts; k++) {
-        int expert_id = expert_indices[token_idx * num_selected_experts + k];
-        float routing_weight = routing_weights[token_idx * num_selected_experts + k];
+    const T* gate_w = gate_weights + expert_id * hidden_dim * intermediate_dim;
+    const T* up_w = up_weights + expert_id * hidden_dim * intermediate_dim;
 
-        const T* gate_w = gate_weights + expert_id * hidden_dim * intermediate_dim;
-        const T* up_w = up_weights + expert_id * hidden_dim * intermediate_dim;
+    const int outputs_per_warp = OUTPUTS_PER_THREAD * WARP_SIZE;
+    const int outputs_per_iter = num_warps * outputs_per_warp;
+
+    // Phase 1: Gate (and Up when needed) with register blocking
+    if constexpr (HAS_DOWN_WEIGHTS) {
+        for (int base_i = warp_id * outputs_per_warp; base_i < intermediate_dim; base_i += outputs_per_iter) {
+            float gate_acc[OUTPUTS_PER_THREAD] = {0};
+            float up_acc[OUTPUTS_PER_THREAD] = {0};
+
+            #pragma unroll 4
+            for (int j = 0; j < hidden_dim; j++) {
+                const float inp = smem_input[j];
+                const int row_off = j * intermediate_dim;
+
+                #pragma unroll
+                for (int r = 0; r < OUTPUTS_PER_THREAD; r++) {
+                    const int i = base_i + lane_id + r * WARP_SIZE;
+                    if (i < intermediate_dim) {
+                        gate_acc[r] += inp * load_as_float(gate_w + row_off + i);
+                        up_acc[r] += inp * load_as_float(up_w + row_off + i);
+                    }
+                }
+            }
+
+            #pragma unroll
+            for (int r = 0; r < OUTPUTS_PER_THREAD; r++) {
+                const int i = base_i + lane_id + r * WARP_SIZE;
+                if (i < intermediate_dim) {
+                    float activated = apply_activation(gate_acc[r], activation_type);
+                    smem_inter[i] = activated * up_acc[r];
+                }
+            }
+        }
+    } else {
+        for (int base_i = warp_id * outputs_per_warp; base_i < intermediate_dim; base_i += outputs_per_iter) {
+            float gate_acc[OUTPUTS_PER_THREAD] = {0};
+
+            #pragma unroll 4
+            for (int j = 0; j < hidden_dim; j++) {
+                const float inp = smem_input[j];
+                const int row_off = j * intermediate_dim;
+
+                #pragma unroll
+                for (int r = 0; r < OUTPUTS_PER_THREAD; r++) {
+                    const int i = base_i + lane_id + r * WARP_SIZE;
+                    if (i < intermediate_dim) {
+                        gate_acc[r] += inp * load_as_float(gate_w + row_off + i);
+                    }
+                }
+            }
+
+            #pragma unroll
+            for (int r = 0; r < OUTPUTS_PER_THREAD; r++) {
+                const int i = base_i + lane_id + r * WARP_SIZE;
+                if (i < intermediate_dim) {
+                    smem_inter[i] = apply_activation(gate_acc[r], activation_type);
+                }
+            }
+        }
+    }
+    __syncthreads();
+
+    // Phase 2: Down projection with register blocking + atomic add
+    T* token_output = output + token_idx * hidden_dim;
+
+    if (HAS_DOWN_WEIGHTS) {
         const T* down_w = down_weights + expert_id * intermediate_dim * hidden_dim;
 
-        for (int i = tid; i < intermediate_dim; i += block_size) {
-            float gate_val = 0.0f;
-            float up_val = 0.0f;
+        for (int base_i = warp_id * outputs_per_warp; base_i < hidden_dim; base_i += outputs_per_iter) {
+            float acc[OUTPUTS_PER_THREAD] = {0};
 
-            for (int j = 0; j < hidden_dim; j++) {
-                float input_val = float(shared_input[j]);
-                gate_val += input_val * float(gate_w[j * intermediate_dim + i]);
-                up_val += input_val * float(up_w[j * intermediate_dim + i]);
-            }
-
-            if (activation_type == 0) {
-                gate_val = silu(gate_val);
-            } else if (activation_type == 1) {
-                gate_val = gelu(gate_val);
-            } else if (activation_type == 2) {
-                gate_val = fmaxf(0.0f, gate_val);
-            }
-
-            shared_intermediate[i] = T(gate_val * up_val);
-        }
-        __syncthreads();
-
-        for (int i = tid; i < hidden_dim; i += block_size) {
-            float down_val = 0.0f;
-
+            #pragma unroll 4
             for (int j = 0; j < intermediate_dim; j++) {
-                down_val += float(shared_intermediate[j]) * float(down_w[j * hidden_dim + i]);
+                const float inter = smem_inter[j];
+                const int row_off = j * hidden_dim;
+
+                #pragma unroll
+                for (int r = 0; r < OUTPUTS_PER_THREAD; r++) {
+                    const int i = base_i + lane_id + r * WARP_SIZE;
+                    if (i < hidden_dim) {
+                        acc[r] += inter * load_as_float(down_w + row_off + i);
+                    }
+                }
             }
 
-            output[token_idx * hidden_dim + i] += T(down_val * routing_weight);
+            #pragma unroll
+            for (int r = 0; r < OUTPUTS_PER_THREAD; r++) {
+                const int i = base_i + lane_id + r * WARP_SIZE;
+                if (i < hidden_dim) {
+                    atomic_add(token_output + i, acc[r] * routing_weight);
+                }
+            }
         }
-        __syncthreads();
+    } else {
+        // Nomic: warp reduction needed
+        for (int i = warp_id; i < hidden_dim; i += num_warps) {
+            float acc = 0.0f;
+
+            #pragma unroll 4
+            for (int j = lane_id; j < intermediate_dim; j += WARP_SIZE) {
+                acc += smem_inter[j] * load_as_float(up_w + i * intermediate_dim + j);
+            }
+
+            // Warp reduction
+            #pragma unroll
+            for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
+                acc += __shfl_xor_sync(0xffffffff, acc, offset);
+            }
+
+            if (lane_id == 0) {
+                atomic_add(token_output + i, acc * routing_weight);
+            }
+        }
     }
 }
 
-// Optimized fused MoE kernel with tiling and better memory access patterns
-template<typename T, int TILE_M, int TILE_N, int TILE_K>
-__global__ void optimized_fused_moe_kernel(
-    const T* __restrict__ input,              // [num_tokens, hidden_dim]
-    const T* __restrict__ gate_weights,       // [num_experts, hidden_dim, intermediate_dim]
-    const T* __restrict__ up_weights,         // [num_experts, hidden_dim, intermediate_dim]
-    const T* __restrict__ down_weights,       // [num_experts, intermediate_dim, hidden_dim]
-    const TokenExpertPair* __restrict__ sorted_pairs,  // Sorted token-expert pairs
-    const int* __restrict__ expert_offsets,   // Start offset for each expert in sorted_pairs
-    T* __restrict__ output,                   // [num_tokens, hidden_dim]
-    T* __restrict__ intermediate_cache,       // [num_tokens, intermediate_dim] workspace
+// ============================================================================
+// Batched Expert Kernel - processes multiple tokens per block
+// Loads weight tiles to shared memory for reuse across tokens
+// ============================================================================
+#define TILE_K 64
+#define TOKENS_PER_BLOCK 4  // Keep at 4 for larger models, smem limited
+
+template<typename T, bool HAS_DOWN_WEIGHTS>
+__global__ __launch_bounds__(BLOCK_SIZE, 2)
+void moe_batched_expert_kernel(
+    const T* __restrict__ input,
+    const T* __restrict__ gate_weights,
+    const T* __restrict__ up_weights,
+    const T* __restrict__ down_weights,
+    const float* __restrict__ routing_weights,
+    const int* __restrict__ token_ids,
+    const int* __restrict__ select_ids,
+    T* __restrict__ output,
+    int expert_id,
+    int num_tokens_for_expert,
+    int hidden_dim,
+    int intermediate_dim,
+    int num_selected_experts,
+    int activation_type
+) {
+    // Shared memory layout:
+    // - Input buffer: TOKENS_PER_BLOCK * hidden_dim
+    // - Weight tile: TILE_K * BLOCK_SIZE (for coalesced access)
+    // - Intermediate: TOKENS_PER_BLOCK * intermediate_dim
+    extern __shared__ float smem[];
+
+    const int block_token_start = blockIdx.x * TOKENS_PER_BLOCK;
+    const int tid = threadIdx.x;
+    const int warp_id = tid / WARP_SIZE;
+    const int lane_id = tid % WARP_SIZE;
+    const int num_warps = BLOCK_SIZE / WARP_SIZE;
+
+    // Pointers into shared memory
+    float* smem_inputs = smem;  // [TOKENS_PER_BLOCK][hidden_dim]
+    float* smem_inter = smem_inputs + TOKENS_PER_BLOCK * (hidden_dim + SMEM_PAD);  // [TOKENS_PER_BLOCK][intermediate_dim]
+
+    const T* gate_w = gate_weights + expert_id * hidden_dim * intermediate_dim;
+    const T* up_w = up_weights + expert_id * hidden_dim * intermediate_dim;
+
+    // Load inputs for all tokens in this block
+    #pragma unroll
+    for (int t = 0; t < TOKENS_PER_BLOCK; t++) {
+        const int global_t = block_token_start + t;
+        if (global_t < num_tokens_for_expert) {
+            const int token_idx = token_ids[global_t];
+            const T* token_input = input + token_idx * hidden_dim;
+            float* smem_input_t = smem_inputs + t * (hidden_dim + SMEM_PAD);
+
+            for (int i = tid; i < hidden_dim; i += BLOCK_SIZE) {
+                smem_input_t[i] = load_as_float(token_input + i);
+            }
+        }
+    }
+    __syncthreads();
+
+    // Phase 1: Gate-Up projection for all tokens
+    const int outputs_per_warp = OUTPUTS_PER_THREAD * WARP_SIZE;
+    const int outputs_per_iter = num_warps * outputs_per_warp;
+
+    for (int base_i = warp_id * outputs_per_warp; base_i < intermediate_dim; base_i += outputs_per_iter) {
+        // Accumulators for each token
+        float gate_acc[TOKENS_PER_BLOCK][OUTPUTS_PER_THREAD];
+        float up_acc[TOKENS_PER_BLOCK][OUTPUTS_PER_THREAD];
+
+        #pragma unroll
+        for (int t = 0; t < TOKENS_PER_BLOCK; t++) {
+            #pragma unroll
+            for (int r = 0; r < OUTPUTS_PER_THREAD; r++) {
+                gate_acc[t][r] = 0.0f;
+                up_acc[t][r] = 0.0f;
+            }
+        }
+
+        // Main computation loop over hidden dimension
+        #pragma unroll 2
+        for (int j = 0; j < hidden_dim; j++) {
+            const int row_off = j * intermediate_dim;
+
+            // Load weight values (same for all tokens)
+            float gate_vals[OUTPUTS_PER_THREAD];
+            float up_vals[OUTPUTS_PER_THREAD];
+
+            #pragma unroll
+            for (int r = 0; r < OUTPUTS_PER_THREAD; r++) {
+                const int i = base_i + lane_id + r * WARP_SIZE;
+                if (i < intermediate_dim) {
+                    gate_vals[r] = load_as_float(gate_w + row_off + i);
+                    up_vals[r] = load_as_float(up_w + row_off + i);
+                }
+            }
+
+            // Apply to all tokens
+            #pragma unroll
+            for (int t = 0; t < TOKENS_PER_BLOCK; t++) {
+                const int global_t = block_token_start + t;
+                if (global_t < num_tokens_for_expert) {
+                    const float inp = smem_inputs[t * (hidden_dim + SMEM_PAD) + j];
+
+                    #pragma unroll
+                    for (int r = 0; r < OUTPUTS_PER_THREAD; r++) {
+                        const int i = base_i + lane_id + r * WARP_SIZE;
+                        if (i < intermediate_dim) {
+                            gate_acc[t][r] += inp * gate_vals[r];
+                            up_acc[t][r] += inp * up_vals[r];
+                        }
+                    }
+                }
+            }
+        }
+
+        // Store intermediate results
+        #pragma unroll
+        for (int t = 0; t < TOKENS_PER_BLOCK; t++) {
+            const int global_t = block_token_start + t;
+            if (global_t < num_tokens_for_expert) {
+                float* smem_inter_t = smem_inter + t * (intermediate_dim + SMEM_PAD);
+
+                #pragma unroll
+                for (int r = 0; r < OUTPUTS_PER_THREAD; r++) {
+                    const int i = base_i + lane_id + r * WARP_SIZE;
+                    if (i < intermediate_dim) {
+                        float activated = apply_activation(gate_acc[t][r], activation_type);
+                        smem_inter_t[i] = HAS_DOWN_WEIGHTS ? (activated * up_acc[t][r]) : activated;
+                    }
+                }
+            }
+        }
+    }
+    __syncthreads();
+
+    // Phase 2: Down projection
+    if (HAS_DOWN_WEIGHTS) {
+        const T* down_w = down_weights + expert_id * intermediate_dim * hidden_dim;
+
+        for (int base_i = warp_id * outputs_per_warp; base_i < hidden_dim; base_i += outputs_per_iter) {
+            float acc[TOKENS_PER_BLOCK][OUTPUTS_PER_THREAD];
+
+            #pragma unroll
+            for (int t = 0; t < TOKENS_PER_BLOCK; t++) {
+                #pragma unroll
+                for (int r = 0; r < OUTPUTS_PER_THREAD; r++) {
+                    acc[t][r] = 0.0f;
+                }
+            }
+
+            #pragma unroll 2
+            for (int j = 0; j < intermediate_dim; j++) {
+                const int row_off = j * hidden_dim;
+
+                // Load weight values
+                float down_vals[OUTPUTS_PER_THREAD];
+                #pragma unroll
+                for (int r = 0; r < OUTPUTS_PER_THREAD; r++) {
+                    const int i = base_i + lane_id + r * WARP_SIZE;
+                    if (i < hidden_dim) {
+                        down_vals[r] = load_as_float(down_w + row_off + i);
+                    }
+                }
+
+                // Apply to all tokens
+                #pragma unroll
+                for (int t = 0; t < TOKENS_PER_BLOCK; t++) {
+                    const int global_t = block_token_start + t;
+                    if (global_t < num_tokens_for_expert) {
+                        const float inter = smem_inter[t * (intermediate_dim + SMEM_PAD) + j];
+
+                        #pragma unroll
+                        for (int r = 0; r < OUTPUTS_PER_THREAD; r++) {
+                            const int i = base_i + lane_id + r * WARP_SIZE;
+                            if (i < hidden_dim) {
+                                acc[t][r] += inter * down_vals[r];
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Write outputs with atomic add
+            #pragma unroll
+            for (int t = 0; t < TOKENS_PER_BLOCK; t++) {
+                const int global_t = block_token_start + t;
+                if (global_t < num_tokens_for_expert) {
+                    const int token_idx = token_ids[global_t];
+                    const int select_idx = select_ids[global_t];
+                    const float routing_weight = routing_weights[token_idx * num_selected_experts + select_idx];
+                    T* token_output = output + token_idx * hidden_dim;
+
+                    #pragma unroll
+                    for (int r = 0; r < OUTPUTS_PER_THREAD; r++) {
+                        const int i = base_i + lane_id + r * WARP_SIZE;
+                        if (i < hidden_dim) {
+                            atomic_add(token_output + i, acc[t][r] * routing_weight);
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        // Nomic path - similar structure with warp reduction
+        for (int t = 0; t < TOKENS_PER_BLOCK; t++) {
+            const int global_t = block_token_start + t;
+            if (global_t >= num_tokens_for_expert) continue;
+
+            const int token_idx = token_ids[global_t];
+            const int select_idx = select_ids[global_t];
+            const float routing_weight = routing_weights[token_idx * num_selected_experts + select_idx];
+            T* token_output = output + token_idx * hidden_dim;
+            float* smem_inter_t = smem_inter + t * (intermediate_dim + SMEM_PAD);
+
+            for (int i = warp_id; i < hidden_dim; i += num_warps) {
+                float acc = 0.0f;
+                for (int j = lane_id; j < intermediate_dim; j += WARP_SIZE) {
+                    acc += smem_inter_t[j] * load_as_float(up_w + i * intermediate_dim + j);
+                }
+
+                // Warp reduction
+                #pragma unroll
+                for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
+                    acc += __shfl_xor_sync(0xffffffff, acc, offset);
+                }
+
+                if (lane_id == 0) {
+                    atomic_add(token_output + i, acc * routing_weight);
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// MEGA KERNEL: All experts in a single launch, no host dispatch
+// Each block finds its expert via binary search in offsets array
+// ============================================================================
+#define MAX_EXPERTS 256
+
+template<typename T, bool HAS_DOWN_WEIGHTS>
+__global__ __launch_bounds__(BLOCK_SIZE, 2)
+void moe_mega_kernel(
+    const T* __restrict__ input,
+    const T* __restrict__ gate_weights,
+    const T* __restrict__ up_weights,
+    const T* __restrict__ down_weights,
+    const float* __restrict__ routing_weights,
+    const int* __restrict__ expert_offsets,  // [num_experts + 1]
+    const int* __restrict__ token_ids,
+    const int* __restrict__ select_ids,
+    T* __restrict__ output,
+    int num_experts,
+    int total_tokens,  // total token-expert assignments
+    int hidden_dim,
+    int intermediate_dim,
+    int num_selected_experts,
+    int activation_type
+) {
+    // Each block processes TOKENS_PER_BLOCK tokens
+    const int block_token_start = blockIdx.x * TOKENS_PER_BLOCK;
+    if (block_token_start >= total_tokens) return;
+
+    // Binary search to find which expert this block belongs to
+    int expert_id = 0;
+    {
+        int lo = 0, hi = num_experts;
+        while (lo < hi) {
+            int mid = (lo + hi + 1) / 2;
+            if (expert_offsets[mid] <= block_token_start) {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        expert_id = lo;
+    }
+
+    const int expert_start = expert_offsets[expert_id];
+    const int expert_end = expert_offsets[expert_id + 1];
+    const int local_start = block_token_start - expert_start;
+
+    extern __shared__ float smem[];
+    float* smem_inputs = smem;
+    float* smem_inter = smem_inputs + TOKENS_PER_BLOCK * (hidden_dim + SMEM_PAD);
+
+    const int tid = threadIdx.x;
+    const int warp_id = tid / WARP_SIZE;
+    const int lane_id = tid % WARP_SIZE;
+    const int num_warps = BLOCK_SIZE / WARP_SIZE;
+
+    const T* gate_w = gate_weights + expert_id * hidden_dim * intermediate_dim;
+    const T* up_w = up_weights + expert_id * hidden_dim * intermediate_dim;
+
+    // Load inputs for tokens in this block
+    #pragma unroll
+    for (int t = 0; t < TOKENS_PER_BLOCK; t++) {
+        const int global_idx = expert_start + local_start + t;
+        if (global_idx < expert_end) {
+            const int token_idx = token_ids[global_idx];
+            const T* token_input = input + token_idx * hidden_dim;
+            float* smem_input_t = smem_inputs + t * (hidden_dim + SMEM_PAD);
+
+            for (int i = tid; i < hidden_dim; i += BLOCK_SIZE) {
+                smem_input_t[i] = load_as_float(token_input + i);
+            }
+        }
+    }
+    __syncthreads();
+
+    // Phase 1: Gate-Up projection
+    const int outputs_per_warp = OUTPUTS_PER_THREAD * WARP_SIZE;
+    const int outputs_per_iter = num_warps * outputs_per_warp;
+
+    for (int base_i = warp_id * outputs_per_warp; base_i < intermediate_dim; base_i += outputs_per_iter) {
+        float gate_acc[TOKENS_PER_BLOCK][OUTPUTS_PER_THREAD];
+        float up_acc[TOKENS_PER_BLOCK][OUTPUTS_PER_THREAD];
+
+        #pragma unroll
+        for (int t = 0; t < TOKENS_PER_BLOCK; t++) {
+            #pragma unroll
+            for (int r = 0; r < OUTPUTS_PER_THREAD; r++) {
+                gate_acc[t][r] = 0.0f;
+                up_acc[t][r] = 0.0f;
+            }
+        }
+
+        #pragma unroll 2
+        for (int j = 0; j < hidden_dim; j++) {
+            const int row_off = j * intermediate_dim;
+
+            float gate_vals[OUTPUTS_PER_THREAD];
+            float up_vals[OUTPUTS_PER_THREAD];
+
+            #pragma unroll
+            for (int r = 0; r < OUTPUTS_PER_THREAD; r++) {
+                const int i = base_i + lane_id + r * WARP_SIZE;
+                if (i < intermediate_dim) {
+                    gate_vals[r] = load_as_float(gate_w + row_off + i);
+                    up_vals[r] = HAS_DOWN_WEIGHTS ? load_as_float(up_w + row_off + i) : 0.0f;
+                }
+            }
+
+            #pragma unroll
+            for (int t = 0; t < TOKENS_PER_BLOCK; t++) {
+                const int global_idx = expert_start + local_start + t;
+                if (global_idx < expert_end) {
+                    const float inp = smem_inputs[t * (hidden_dim + SMEM_PAD) + j];
+
+                    #pragma unroll
+                    for (int r = 0; r < OUTPUTS_PER_THREAD; r++) {
+                        const int i = base_i + lane_id + r * WARP_SIZE;
+                        if (i < intermediate_dim) {
+                            gate_acc[t][r] += inp * gate_vals[r];
+                            if (HAS_DOWN_WEIGHTS) up_acc[t][r] += inp * up_vals[r];
+                        }
+                    }
+                }
+            }
+        }
+
+        #pragma unroll
+        for (int t = 0; t < TOKENS_PER_BLOCK; t++) {
+            const int global_idx = expert_start + local_start + t;
+            if (global_idx < expert_end) {
+                float* smem_inter_t = smem_inter + t * (intermediate_dim + SMEM_PAD);
+
+                #pragma unroll
+                for (int r = 0; r < OUTPUTS_PER_THREAD; r++) {
+                    const int i = base_i + lane_id + r * WARP_SIZE;
+                    if (i < intermediate_dim) {
+                        float activated = apply_activation(gate_acc[t][r], activation_type);
+                        smem_inter_t[i] = HAS_DOWN_WEIGHTS ? (activated * up_acc[t][r]) : activated;
+                    }
+                }
+            }
+        }
+    }
+    __syncthreads();
+
+    // Phase 2: Down projection
+    if (HAS_DOWN_WEIGHTS) {
+        const T* down_w = down_weights + expert_id * intermediate_dim * hidden_dim;
+
+        for (int base_i = warp_id * outputs_per_warp; base_i < hidden_dim; base_i += outputs_per_iter) {
+            float acc[TOKENS_PER_BLOCK][OUTPUTS_PER_THREAD];
+
+            #pragma unroll
+            for (int t = 0; t < TOKENS_PER_BLOCK; t++) {
+                #pragma unroll
+                for (int r = 0; r < OUTPUTS_PER_THREAD; r++) {
+                    acc[t][r] = 0.0f;
+                }
+            }
+
+            #pragma unroll 2
+            for (int j = 0; j < intermediate_dim; j++) {
+                const int row_off = j * hidden_dim;
+
+                float down_vals[OUTPUTS_PER_THREAD];
+                #pragma unroll
+                for (int r = 0; r < OUTPUTS_PER_THREAD; r++) {
+                    const int i = base_i + lane_id + r * WARP_SIZE;
+                    if (i < hidden_dim) {
+                        down_vals[r] = load_as_float(down_w + row_off + i);
+                    }
+                }
+
+                #pragma unroll
+                for (int t = 0; t < TOKENS_PER_BLOCK; t++) {
+                    const int global_idx = expert_start + local_start + t;
+                    if (global_idx < expert_end) {
+                        const float inter = smem_inter[t * (intermediate_dim + SMEM_PAD) + j];
+
+                        #pragma unroll
+                        for (int r = 0; r < OUTPUTS_PER_THREAD; r++) {
+                            const int i = base_i + lane_id + r * WARP_SIZE;
+                            if (i < hidden_dim) {
+                                acc[t][r] += inter * down_vals[r];
+                            }
+                        }
+                    }
+                }
+            }
+
+            #pragma unroll
+            for (int t = 0; t < TOKENS_PER_BLOCK; t++) {
+                const int global_idx = expert_start + local_start + t;
+                if (global_idx < expert_end) {
+                    const int token_idx = token_ids[global_idx];
+                    const int select_idx = select_ids[global_idx];
+                    const float routing_weight = routing_weights[token_idx * num_selected_experts + select_idx];
+                    T* token_output = output + token_idx * hidden_dim;
+
+                    #pragma unroll
+                    for (int r = 0; r < OUTPUTS_PER_THREAD; r++) {
+                        const int i = base_i + lane_id + r * WARP_SIZE;
+                        if (i < hidden_dim) {
+                            atomic_add(token_output + i, acc[t][r] * routing_weight);
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        // Nomic path
+        for (int t = 0; t < TOKENS_PER_BLOCK; t++) {
+            const int global_idx = expert_start + local_start + t;
+            if (global_idx >= expert_end) continue;
+
+            const int token_idx = token_ids[global_idx];
+            const int select_idx = select_ids[global_idx];
+            const float routing_weight = routing_weights[token_idx * num_selected_experts + select_idx];
+            T* token_output = output + token_idx * hidden_dim;
+            float* smem_inter_t = smem_inter + t * (intermediate_dim + SMEM_PAD);
+
+            for (int i = warp_id; i < hidden_dim; i += num_warps) {
+                float acc = 0.0f;
+                for (int j = lane_id; j < intermediate_dim; j += WARP_SIZE) {
+                    acc += smem_inter_t[j] * load_as_float(up_w + i * intermediate_dim + j);
+                }
+
+                #pragma unroll
+                for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
+                    acc += __shfl_xor_sync(0xffffffff, acc, offset);
+                }
+
+                if (lane_id == 0) {
+                    atomic_add(token_output + i, acc * routing_weight);
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Preprocessing kernels for expert-parallel mode
+// ============================================================================
+__global__ void count_tokens_per_expert_kernel(
+    const uint32_t* __restrict__ expert_indices,
+    int* __restrict__ counts,
+    int total_assignments
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < total_assignments) {
+        atomicAdd(&counts[expert_indices[idx]], 1);
+    }
+}
+
+// GPU-based exclusive prefix sum (fast for small num_experts <= 256)
+__global__ void exclusive_scan_kernel(
+    const int* __restrict__ counts,
+    int* __restrict__ offsets,
+    int num_experts
+) {
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        int sum = 0;
+        for (int i = 0; i < num_experts; i++) {
+            offsets[i] = sum;
+            sum += counts[i];
+        }
+        offsets[num_experts] = sum;
+    }
+}
+
+__global__ void build_token_lists_kernel(
+    const uint32_t* __restrict__ expert_indices,
+    const int* __restrict__ offsets,
+    int* __restrict__ token_ids_out,
+    int* __restrict__ select_ids_out,
+    int* __restrict__ counters,
+    int num_tokens,
+    int num_selected
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= num_tokens * num_selected) return;
+
+    int token_idx = idx / num_selected;
+    int select_idx = idx % num_selected;
+    int expert_id = expert_indices[idx];
+
+    int pos = atomicAdd(&counters[expert_id], 1);
+    int out_idx = offsets[expert_id] + pos;
+    token_ids_out[out_idx] = token_idx;
+    select_ids_out[out_idx] = select_idx;
+}
+
+// ============================================================================
+// C Interface
+// ============================================================================
+extern "C" {
+
+// Standard token-parallel MoE
+void fused_moe(
+    void* input,
+    void* gate_weights,
+    void* up_weights,
+    void* down_weights,
+    float* routing_weights,
+    uint32_t* expert_indices,
+    void* output,
+    int num_tokens,
+    int hidden_dim,
+    int intermediate_dim,
+    int num_selected_experts,
+    int activation_type,
+    uint32_t moe_type,  // 0 = Qwen3 (has down), 1 = Nomic (no down)
+    uint32_t dtype      // 0 = FP16, 1 = BF16, 2 = FP32
+) {
+    ensure_device_info();
+
+    const int smem_size = (hidden_dim + SMEM_PAD + intermediate_dim + SMEM_PAD) * sizeof(float);
+    if (smem_size > g_max_smem) return;
+
+    const bool has_down = (moe_type == 0);
+    cudaStream_t stream = 0;
+
+    #define LAUNCH_KERNEL(T) \
+        cudaFuncSetAttribute(has_down ? moe_kernel<T, true> : moe_kernel<T, false>, \
+            cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size); \
+        if (has_down) { \
+            moe_kernel<T, true><<<num_tokens, BLOCK_SIZE, smem_size, stream>>>( \
+                (const T*)input, (const T*)gate_weights, (const T*)up_weights, (const T*)down_weights, \
+                routing_weights, expert_indices, (T*)output, \
+                hidden_dim, intermediate_dim, num_selected_experts, activation_type); \
+        } else { \
+            moe_kernel<T, false><<<num_tokens, BLOCK_SIZE, smem_size, stream>>>( \
+                (const T*)input, (const T*)gate_weights, (const T*)up_weights, (const T*)down_weights, \
+                routing_weights, expert_indices, (T*)output, \
+                hidden_dim, intermediate_dim, num_selected_experts, activation_type); \
+        }
+
+    if (dtype == 0) { LAUNCH_KERNEL(half); }
+    else if (dtype == 1) { LAUNCH_KERNEL(__nv_bfloat16); }
+    else { LAUNCH_KERNEL(float); }
+
+    #undef LAUNCH_KERNEL
+}
+
+// Expert-parallel MoE (call once per expert)
+// Automatically uses batched kernel for better weight reuse when enough tokens
+void fused_moe_expert(
+    void* input,
+    void* gate_weights,
+    void* up_weights,
+    void* down_weights,
+    float* routing_weights,
+    int* token_ids,
+    int* select_ids,
+    void* output,
+    int expert_id,
+    int num_tokens_for_expert,
+    int hidden_dim,
+    int intermediate_dim,
+    int num_selected_experts,
+    int activation_type,
+    uint32_t moe_type,
+    uint32_t dtype
+) {
+    if (num_tokens_for_expert == 0) return;
+
+    ensure_device_info();
+
+    const bool has_down = (moe_type == 0);
+    cudaStream_t stream = 0;
+
+    // Use batched kernel when we have enough tokens for weight reuse benefit
+    const bool use_batched = (num_tokens_for_expert >= TOKENS_PER_BLOCK);
+
+    if (use_batched) {
+        // Batched kernel: multiple tokens per block share weight loads
+        const int batched_smem = TOKENS_PER_BLOCK * (hidden_dim + SMEM_PAD + intermediate_dim + SMEM_PAD) * sizeof(float);
+        if (batched_smem > g_max_smem) goto use_single;  // Fallback if not enough smem
+
+        const int num_blocks = (num_tokens_for_expert + TOKENS_PER_BLOCK - 1) / TOKENS_PER_BLOCK;
+
+        #define LAUNCH_BATCHED_KERNEL(T) \
+            cudaFuncSetAttribute(has_down ? moe_batched_expert_kernel<T, true> : moe_batched_expert_kernel<T, false>, \
+                cudaFuncAttributeMaxDynamicSharedMemorySize, batched_smem); \
+            if (has_down) { \
+                moe_batched_expert_kernel<T, true><<<num_blocks, BLOCK_SIZE, batched_smem, stream>>>( \
+                    (const T*)input, (const T*)gate_weights, (const T*)up_weights, (const T*)down_weights, \
+                    routing_weights, token_ids, select_ids, (T*)output, \
+                    expert_id, num_tokens_for_expert, hidden_dim, intermediate_dim, num_selected_experts, activation_type); \
+            } else { \
+                moe_batched_expert_kernel<T, false><<<num_blocks, BLOCK_SIZE, batched_smem, stream>>>( \
+                    (const T*)input, (const T*)gate_weights, (const T*)up_weights, (const T*)down_weights, \
+                    routing_weights, token_ids, select_ids, (T*)output, \
+                    expert_id, num_tokens_for_expert, hidden_dim, intermediate_dim, num_selected_experts, activation_type); \
+            }
+
+        if (dtype == 0) { LAUNCH_BATCHED_KERNEL(half); }
+        else if (dtype == 1) { LAUNCH_BATCHED_KERNEL(__nv_bfloat16); }
+        else { LAUNCH_BATCHED_KERNEL(float); }
+
+        #undef LAUNCH_BATCHED_KERNEL
+        return;
+    }
+
+use_single:
+    // Single-token kernel: one token per block
+    const int smem_size = (hidden_dim + SMEM_PAD + intermediate_dim + SMEM_PAD) * sizeof(float);
+    if (smem_size > g_max_smem) return;
+
+    #define LAUNCH_EXPERT_KERNEL(T) \
+        cudaFuncSetAttribute(has_down ? moe_expert_kernel<T, true> : moe_expert_kernel<T, false>, \
+            cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size); \
+        if (has_down) { \
+            moe_expert_kernel<T, true><<<num_tokens_for_expert, BLOCK_SIZE, smem_size, stream>>>( \
+                (const T*)input, (const T*)gate_weights, (const T*)up_weights, (const T*)down_weights, \
+                routing_weights, token_ids, select_ids, (T*)output, \
+                expert_id, num_tokens_for_expert, hidden_dim, intermediate_dim, num_selected_experts, activation_type); \
+        } else { \
+            moe_expert_kernel<T, false><<<num_tokens_for_expert, BLOCK_SIZE, smem_size, stream>>>( \
+                (const T*)input, (const T*)gate_weights, (const T*)up_weights, (const T*)down_weights, \
+                routing_weights, token_ids, select_ids, (T*)output, \
+                expert_id, num_tokens_for_expert, hidden_dim, intermediate_dim, num_selected_experts, activation_type); \
+        }
+
+    if (dtype == 0) { LAUNCH_EXPERT_KERNEL(half); }
+    else if (dtype == 1) { LAUNCH_EXPERT_KERNEL(__nv_bfloat16); }
+    else { LAUNCH_EXPERT_KERNEL(float); }
+
+    #undef LAUNCH_EXPERT_KERNEL
+}
+
+// Helper: count tokens per expert
+void moe_count_tokens(
+    uint32_t* expert_indices,
+    int* expert_counts,
+    int num_tokens,
+    int num_selected,
+    int num_experts
+) {
+    int total = num_tokens * num_selected;
+    int blocks = (total + 255) / 256;
+    count_tokens_per_expert_kernel<<<blocks, 256>>>(expert_indices, expert_counts, total);
+}
+
+// Helper: build sorted token lists
+void moe_build_indices(
+    uint32_t* expert_indices,
+    int* expert_offsets,
+    int* token_ids_out,
+    int* select_ids_out,
+    int* counters,
+    int num_tokens,
+    int num_selected
+) {
+    int total = num_tokens * num_selected;
+    int blocks = (total + 255) / 256;
+    build_token_lists_kernel<<<blocks, 256>>>(
+        expert_indices, expert_offsets, token_ids_out, select_ids_out,
+        counters, num_tokens, num_selected);
+}
+
+// Query device info
+void moe_get_device_info(int* sm_count, int* max_smem) {
+    ensure_device_info();
+    *sm_count = g_sm_count;
+    *max_smem = g_max_smem;
+}
+
+// ==========================================================================
+// AUTO MODE: Single mega-kernel launch, NO host synchronization
+// All experts processed in one kernel using GPU-side dispatch
+// ==========================================================================
+void fused_moe_auto(
+    void* input,
+    void* gate_weights,
+    void* up_weights,
+    void* down_weights,
+    float* routing_weights,
+    uint32_t* expert_indices,
+    void* output,
     int num_tokens,
     int hidden_dim,
     int intermediate_dim,
     int num_experts,
-    int total_pairs,
-    int activation_type                       // 0: SiLU, 1: GELU, 2: ReLU
+    int num_selected_experts,
+    int activation_type,
+    uint32_t moe_type,
+    uint32_t dtype,
+    // Workspace (caller provides pre-allocated buffers)
+    int* expert_counts,      // [num_experts]
+    int* expert_offsets,     // [num_experts + 1]
+    int* token_ids,          // [num_tokens * num_selected_experts]
+    int* select_ids,         // [num_tokens * num_selected_experts]
+    int* counters            // [num_experts] - temp for atomic counters
 ) {
-    // Thread block processes one tile of the output
-    const int tid = threadIdx.x + threadIdx.y * blockDim.x;
-    const int warp_id = tid / WARP_SIZE;
-    const int lane_id = tid % WARP_SIZE;
-
-    // Shared memory for tiles
-    extern __shared__ char shared_mem[];
-    T* tile_input = (T*)shared_mem;
-    T* tile_weight = tile_input + TILE_M * TILE_K;
-    float* tile_accum = (float*)(tile_weight + TILE_K * TILE_N);
-
-    // Grid-stride loop over expert groups
-    for (int expert_id = blockIdx.z; expert_id < num_experts; expert_id += gridDim.z) {
-        int start_idx = (expert_id == 0) ? 0 : expert_offsets[expert_id - 1];
-        int end_idx = expert_offsets[expert_id];
-
-        if (start_idx >= end_idx) continue;
-
-        // Get expert weight pointers
-        const T* gate_w = gate_weights + expert_id * hidden_dim * intermediate_dim;
-        const T* up_w = up_weights + expert_id * hidden_dim * intermediate_dim;
-        const T* down_w = down_weights + expert_id * intermediate_dim * hidden_dim;
-
-        // Process tokens assigned to this expert in blocks
-        for (int token_block = start_idx + blockIdx.x * TILE_M; 
-             token_block < end_idx; 
-             token_block += gridDim.x * TILE_M) {
-
-            // Phase 1: Compute gate and up projections
-            for (int out_tile = blockIdx.y * TILE_N; 
-                 out_tile < intermediate_dim; 
-                 out_tile += gridDim.y * TILE_N) {
-
-                // Initialize accumulator
-                float accum_gate[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-                float accum_up[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-
-                // Loop over K dimension in tiles
-                for (int k_tile = 0; k_tile < hidden_dim; k_tile += TILE_K) {
-                    // Cooperatively load input tile
-                    __syncthreads();
-                    for (int idx = tid; idx < TILE_M * TILE_K; idx += blockDim.x * blockDim.y) {
-                        int local_m = idx / TILE_K;
-                        int local_k = idx % TILE_K;
-                        int token_idx = token_block + local_m;
-
-                        if (token_idx < end_idx && k_tile + local_k < hidden_dim) {
-                            int actual_token = sorted_pairs[token_idx].token_idx;
-                            tile_input[local_m * TILE_K + local_k] = 
-                                input[actual_token * hidden_dim + k_tile + local_k];
-                        } else {
-                            tile_input[local_m * TILE_K + local_k] = T(0);
-                        }
-                    }
-
-                    // Load weight tiles for gate and up
-                    for (int idx = tid; idx < TILE_K * TILE_N; idx += blockDim.x * blockDim.y) {
-                        int local_k = idx / TILE_N;
-                        int local_n = idx % TILE_N;
-
-                        if (k_tile + local_k < hidden_dim && out_tile + local_n < intermediate_dim) {
-                            // Gate weights
-                            tile_weight[local_k * TILE_N + local_n] = 
-                                gate_w[(k_tile + local_k) * intermediate_dim + out_tile + local_n];
-                        } else {
-                            tile_weight[local_k * TILE_N + local_n] = T(0);
-                        }
-                    }
-                    __syncthreads();
-
-                    // Compute partial dot products for gate
-                    int local_m = threadIdx.y;
-                    int local_n = threadIdx.x;
-
-                    if (local_m < TILE_M && local_n < TILE_N) {
-                        for (int k = 0; k < TILE_K; k++) {
-                            accum_gate[0] += float(tile_input[local_m * TILE_K + k]) * 
-                                           float(tile_weight[k * TILE_N + local_n]);
-                        }
-                    }
-
-                    // Load up weights
-                    __syncthreads();
-                    for (int idx = tid; idx < TILE_K * TILE_N; idx += blockDim.x * blockDim.y) {
-                        int local_k = idx / TILE_N;
-                        int local_n = idx % TILE_N;
-
-                        if (k_tile + local_k < hidden_dim && out_tile + local_n < intermediate_dim) {
-                            tile_weight[local_k * TILE_N + local_n] = 
-                                up_w[(k_tile + local_k) * intermediate_dim + out_tile + local_n];
-                        }
-                    }
-                    __syncthreads();
-
-                    // Compute partial dot products for up
-                    if (local_m < TILE_M && local_n < TILE_N) {
-                        for (int k = 0; k < TILE_K; k++) {
-                            accum_up[0] += float(tile_input[local_m * TILE_K + k]) * 
-                                         float(tile_weight[k * TILE_N + local_n]);
-                        }
-                    }
-                }
-
-                // Apply activation and store intermediate results
-                __syncthreads();
-                int local_m = threadIdx.y;
-                int local_n = threadIdx.x;
-
-                if (local_m < TILE_M && local_n < TILE_N) {
-                    int token_idx = token_block + local_m;
-                    int out_idx = out_tile + local_n;
-
-                    if (token_idx < end_idx && out_idx < intermediate_dim) {
-                        float gate_val = accum_gate[0];
-                        float up_val = accum_up[0];
-
-                        // Apply activation
-                        if (activation_type == 0) {
-                            gate_val = silu(gate_val);
-                        } else if (activation_type == 1) {
-                            gate_val = gelu(gate_val);
-                        } else {
-                            gate_val = fmaxf(0.0f, gate_val);
-                        }
-
-                        // Store to intermediate cache
-                        int actual_token = sorted_pairs[token_idx].token_idx;
-                        intermediate_cache[actual_token * intermediate_dim + out_idx] = 
-                            T(gate_val * up_val);
-                    }
-                }
-            }
-        }
-
-        __syncthreads();
-
-        // Phase 2: Down projection
-        for (int token_block = start_idx + blockIdx.x * TILE_M; 
-             token_block < end_idx; 
-             token_block += gridDim.x * TILE_M) {
-
-            for (int out_tile = blockIdx.y * TILE_N; 
-                 out_tile < hidden_dim; 
-                 out_tile += gridDim.y * TILE_N) {
-
-                float accum[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-
-                // Loop over K dimension (intermediate_dim)
-                for (int k_tile = 0; k_tile < intermediate_dim; k_tile += TILE_K) {
-                    // Load intermediate results
-                    __syncthreads();
-                    for (int idx = tid; idx < TILE_M * TILE_K; idx += blockDim.x * blockDim.y) {
-                        int local_m = idx / TILE_K;
-                        int local_k = idx % TILE_K;
-                        int token_idx = token_block + local_m;
-
-                        if (token_idx < end_idx && k_tile + local_k < intermediate_dim) {
-                            int actual_token = sorted_pairs[token_idx].token_idx;
-                            tile_input[local_m * TILE_K + local_k] = 
-                                intermediate_cache[actual_token * intermediate_dim + k_tile + local_k];
-                        } else {
-                            tile_input[local_m * TILE_K + local_k] = T(0);
-                        }
-                    }
-
-                    // Load down weights
-                    for (int idx = tid; idx < TILE_K * TILE_N; idx += blockDim.x * blockDim.y) {
-                        int local_k = idx / TILE_N;
-                        int local_n = idx % TILE_N;
-
-                        if (k_tile + local_k < intermediate_dim && out_tile + local_n < hidden_dim) {
-                            tile_weight[local_k * TILE_N + local_n] = 
-                                down_w[(k_tile + local_k) * hidden_dim + out_tile + local_n];
-                        }
-                    }
-                    __syncthreads();
-
-                    // Compute partial products
-                    int local_m = threadIdx.y;
-                    int local_n = threadIdx.x;
-
-                    if (local_m < TILE_M && local_n < TILE_N) {
-                        for (int k = 0; k < TILE_K; k++) {
-                            accum[0] += float(tile_input[local_m * TILE_K + k]) * 
-                                       float(tile_weight[k * TILE_N + local_n]);
-                        }
-                    }
-                }
-
-                // Accumulate to output with routing weights
-                int local_m = threadIdx.y;
-                int local_n = threadIdx.x;
-
-                if (local_m < TILE_M && local_n < TILE_N) {
-                    int token_idx = token_block + local_m;
-                    int out_idx = out_tile + local_n;
-
-                    if (token_idx < end_idx && out_idx < hidden_dim) {
-                        int actual_token = sorted_pairs[token_idx].token_idx;
-                        float routing_weight = sorted_pairs[token_idx].routing_weight;
-
-                        atomicAdd(&output[actual_token * hidden_dim + out_idx], 
-                                  T(accum[0] * routing_weight));
-                    }
-                }
-            }
-        }
+    // For small batches, use token-parallel (simpler, less overhead)
+    if (num_tokens < 16) {
+        fused_moe(input, gate_weights, up_weights, down_weights,
+                  routing_weights, expert_indices, output,
+                  num_tokens, hidden_dim, intermediate_dim,
+                  num_selected_experts, activation_type, moe_type, dtype);
+        return;
     }
+
+    ensure_device_info();
+    cudaStream_t stream = 0;
+
+    // Step 1: Zero counters and counts
+    cudaMemsetAsync(expert_counts, 0, num_experts * sizeof(int), stream);
+    cudaMemsetAsync(counters, 0, num_experts * sizeof(int), stream);
+
+    // Step 2: Count tokens per expert
+    int total_assignments = num_tokens * num_selected_experts;
+    int count_blocks = (total_assignments + 255) / 256;
+    count_tokens_per_expert_kernel<<<count_blocks, 256, 0, stream>>>(
+        expert_indices, expert_counts, total_assignments);
+
+    // Step 3: Compute offsets (exclusive scan) - on GPU
+    exclusive_scan_kernel<<<1, 1, 0, stream>>>(expert_counts, expert_offsets, num_experts);
+
+    // Step 4: Build token lists
+    build_token_lists_kernel<<<count_blocks, 256, 0, stream>>>(
+        expert_indices, expert_offsets, token_ids, select_ids,
+        counters, num_tokens, num_selected_experts);
+
+    // Step 5: Zero output
+    size_t output_bytes = (size_t)num_tokens * hidden_dim * (dtype == 2 ? 4 : 2);
+    cudaMemsetAsync(output, 0, output_bytes, stream);
+
+    // Step 6: Launch MEGA kernel - all experts in ONE launch, NO host sync!
+    const int mega_smem = TOKENS_PER_BLOCK * (hidden_dim + SMEM_PAD + intermediate_dim + SMEM_PAD) * sizeof(float);
+    const int total_blocks = (total_assignments + TOKENS_PER_BLOCK - 1) / TOKENS_PER_BLOCK;
+    const bool has_down = (moe_type == 0);
+
+    #define LAUNCH_MEGA_KERNEL(T) \
+        cudaFuncSetAttribute(has_down ? moe_mega_kernel<T, true> : moe_mega_kernel<T, false>, \
+            cudaFuncAttributeMaxDynamicSharedMemorySize, mega_smem); \
+        if (has_down) { \
+            moe_mega_kernel<T, true><<<total_blocks, BLOCK_SIZE, mega_smem, stream>>>( \
+                (const T*)input, (const T*)gate_weights, (const T*)up_weights, (const T*)down_weights, \
+                routing_weights, expert_offsets, token_ids, select_ids, (T*)output, \
+                num_experts, total_assignments, hidden_dim, intermediate_dim, num_selected_experts, activation_type); \
+        } else { \
+            moe_mega_kernel<T, false><<<total_blocks, BLOCK_SIZE, mega_smem, stream>>>( \
+                (const T*)input, (const T*)gate_weights, (const T*)up_weights, (const T*)down_weights, \
+                routing_weights, expert_offsets, token_ids, select_ids, (T*)output, \
+                num_experts, total_assignments, hidden_dim, intermediate_dim, num_selected_experts, activation_type); \
+        }
+
+    if (dtype == 0) { LAUNCH_MEGA_KERNEL(half); }
+    else if (dtype == 1) { LAUNCH_MEGA_KERNEL(__nv_bfloat16); }
+    else { LAUNCH_MEGA_KERNEL(float); }
+
+    #undef LAUNCH_MEGA_KERNEL
 }
 
-// Kernel to sort tokens by expert for better data locality
-__global__ void prepare_sorted_pairs(
-    const uint32_t* expert_indices,     // [num_tokens, num_selected_experts]
-    const float* routing_weights,       // [num_tokens, num_selected_experts]
-    TokenExpertPair* sorted_pairs,      // Output: sorted pairs
-    int* expert_counts,                 // Output: count per expert
-    int num_tokens,
-    int num_selected_experts
-) {
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
-
-    if (tid < num_tokens * num_selected_experts) {
-        int token_idx = tid / num_selected_experts;
-        int k = tid % num_selected_experts;
-
-        TokenExpertPair pair;
-        pair.token_idx = token_idx;
-        pair.expert_idx = expert_indices[tid];
-        pair.routing_weight = routing_weights[tid];
-        pair.original_idx = tid;
-
-        sorted_pairs[tid] = pair;
-
-        // Count tokens per expert
-        atomicAdd(&expert_counts[pair.expert_idx], 1);
-    }
-}
-
-#define CALL_NOMIC_FUSED_MOE(T)                                                 \
-  nomic_fused_moe_kernel<T><<<num_tokens, threads, shared_mem_size, stream>>>(  \
-    reinterpret_cast<T*>(input),                                                \
-    reinterpret_cast<T*>(gate_weights),                                         \
-    reinterpret_cast<T*>(up_weights),                                           \
-    routing_weights,                                                            \
-    expert_indices,                                                             \
-    reinterpret_cast<T*>(output),                                               \
-    num_tokens,                                                                 \
-    hidden_dim,                                                                 \
-    intermediate_dim,                                                           \
-    num_selected_experts,                                                       \
-    activation_type                                                             \
-  );
-
-#define CALL_QWEN3_FUSED_MOE(T)                                                 \
-  qwen3_fused_moe_kernel<T><<<num_tokens, threads, shared_mem_size, stream>>>(  \
-    reinterpret_cast<T*>(input),                                                \
-    reinterpret_cast<T*>(gate_weights),                                         \
-    reinterpret_cast<T*>(up_weights),                                           \
-    reinterpret_cast<T*>(down_weights),                                         \
-    routing_weights,                                                            \
-    expert_indices,                                                             \
-    reinterpret_cast<T*>(output),                                               \
-    num_tokens,                                                                 \
-    hidden_dim,                                                                 \
-    intermediate_dim,                                                           \
-    num_selected_experts,                                                       \
-    activation_type                                                             \
-  );
-
-// C interface for optimized fused MoE
-extern "C" {
-    void fused_moe(
-        void* input,
-        void* gate_weights,
-        void* up_weights,
-        void* down_weights,
-        float* routing_weights,
-        uint32_t* expert_indices,
-        void* output,
-        int num_tokens,
-        int hidden_dim,
-        int intermediate_dim,
-        int num_selected_experts,
-        int activation_type,
-        uint32_t moe_type,       // 0 => qwen3, 1 => nomic
-        uint32_t dtype           // 0 => f16; 1 => bf16; 2 => f32
-    ) {
-        const cudaStream_t stream = 0;
-        const int threads = 256;
-
-        if (moe_type == 0) {
-            if (dtype == 0) {
-                int shared_mem_size = (hidden_dim + intermediate_dim) * sizeof(half);
-                CALL_QWEN3_FUSED_MOE(half);
-            } else if (dtype == 1) {
-                int shared_mem_size = (hidden_dim + intermediate_dim) * sizeof(__nv_bfloat16);
-                CALL_QWEN3_FUSED_MOE(__nv_bfloat16);
-            } else {
-                int shared_mem_size = (hidden_dim + intermediate_dim) * sizeof(float);
-                CALL_QWEN3_FUSED_MOE(float);
-            }
-        } else if (moe_type == 1) {
-            if (dtype == 0) {
-                int shared_mem_size = (hidden_dim + intermediate_dim) * sizeof(half);
-                CALL_NOMIC_FUSED_MOE(half);
-            } else if (dtype == 1) {
-                int shared_mem_size = (hidden_dim + intermediate_dim) * sizeof(__nv_bfloat16);
-                CALL_NOMIC_FUSED_MOE(__nv_bfloat16);
-            } else {
-                int shared_mem_size = (hidden_dim + intermediate_dim) * sizeof(float);
-                CALL_NOMIC_FUSED_MOE(float);
-            }
-        }
-    }
 } // extern "C"
