@@ -40,6 +40,7 @@ unsafe extern "C" {
         num_tokens: i32,
         hidden_dim: i32,
         intermediate_dim: i32,
+        num_experts: i32,
         num_selected_experts: i32,
         activation_type: i32,
         moe_type: u32,
@@ -50,5 +51,6 @@ unsafe extern "C" {
         token_ids: *mut c_int,
         select_ids: *mut c_int,
         counters: *mut c_int,
+        block_offsets: *mut c_int,
     );
 }

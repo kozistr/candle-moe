@@ -49,6 +49,8 @@ fn main() -> Result<()> {
     // --- Setup tensors ---
     let hidden_states =
         Tensor::randn(0.0f32, 1.0, (seq_len, hidden_size), &device)?.to_dtype(dtype)?;
+    let weights =
+        Tensor::randn(0.0f32, 1.0, (seq_len, num_experts), &device)?.to_dtype(DType::F32)?;
     let gate_weights = Tensor::randn(
         0.0,
         1.0,
@@ -63,7 +65,7 @@ fn main() -> Result<()> {
         &device,
     )?
     .to_dtype(dtype)?;
-    let (scores, indices) = forward_moe_router(&hidden_states, seq_len, top_k, &device)?;
+    let (scores, indices) = forward_moe_router(&weights, seq_len, top_k, &device)?;
 
     let fused_moe = candle_moe::FusedMoE {
         num_experts: gate_weights.dim(0)?,

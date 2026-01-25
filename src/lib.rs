@@ -445,65 +445,24 @@ impl FusedMoE {
 
         // Use expert-parallel kernel for large batches (much faster due to weight reuse)
         if num_tokens >= 16 {
+            // Allocate workspace buffers for expert-parallel processing.
+            // Using U32 which maps to 32-bit integers expected by C interface.
             let total_assignments = num_tokens * self.num_selected_experts;
+            let cuda_dev = input_cuda.device();
 
-            // These are temporary buffers for the preprocessing step
-            let expert_counts = Tensor::zeros(self.num_experts, DType::U32, input.device())?;
-            let expert_offsets = Tensor::zeros(self.num_experts + 1, DType::U32, input.device())?;
-            let token_ids = Tensor::zeros(total_assignments, DType::U32, input.device())?;
-            let select_ids = Tensor::zeros(total_assignments, DType::U32, input.device())?;
-            let counters = Tensor::zeros(self.num_experts, DType::U32, input.device())?;
+            let expert_counts = cuda_dev.alloc_zeros::<u32>(self.num_experts)?;
+            let counters = cuda_dev.alloc_zeros::<u32>(self.num_experts)?;
+            let expert_offsets = unsafe { cuda_dev.alloc::<u32>(self.num_experts + 1)? };
+            let block_offsets = unsafe { cuda_dev.alloc::<u32>(self.num_experts + 1)? };
+            let token_ids = unsafe { cuda_dev.alloc::<u32>(total_assignments)? };
+            let select_ids = unsafe { cuda_dev.alloc::<u32>(total_assignments)? };
 
-            // Get pointers to workspace buffers
-            let (counts_storage, counts_layout) = expert_counts.storage_and_layout();
-            let counts_cuda = match &*counts_storage {
-                Storage::Cuda(cs) => cs,
-                _ => candle::bail!("workspace must be cuda"),
-            };
-            let counts_slice = counts_cuda
-                .as_cuda_slice::<u32>()?
-                .slice(counts_layout.start_offset()..);
-            let (counts_devptr, _) = counts_slice.device_ptr(stream_ref);
-
-            let (offsets_storage, offsets_layout) = expert_offsets.storage_and_layout();
-            let offsets_cuda = match &*offsets_storage {
-                Storage::Cuda(cs) => cs,
-                _ => candle::bail!("workspace must be cuda"),
-            };
-            let offsets_slice = offsets_cuda
-                .as_cuda_slice::<u32>()?
-                .slice(offsets_layout.start_offset()..);
-            let (offsets_devptr, _) = offsets_slice.device_ptr(stream_ref);
-
-            let (tids_storage, tids_layout) = token_ids.storage_and_layout();
-            let tids_cuda = match &*tids_storage {
-                Storage::Cuda(cs) => cs,
-                _ => candle::bail!("workspace must be cuda"),
-            };
-            let tids_slice = tids_cuda
-                .as_cuda_slice::<u32>()?
-                .slice(tids_layout.start_offset()..);
-            let (tids_devptr, _) = tids_slice.device_ptr(stream_ref);
-
-            let (sids_storage, sids_layout) = select_ids.storage_and_layout();
-            let sids_cuda = match &*sids_storage {
-                Storage::Cuda(cs) => cs,
-                _ => candle::bail!("workspace must be cuda"),
-            };
-            let sids_slice = sids_cuda
-                .as_cuda_slice::<u32>()?
-                .slice(sids_layout.start_offset()..);
-            let (sids_devptr, _) = sids_slice.device_ptr(stream_ref);
-
-            let (ctrs_storage, ctrs_layout) = counters.storage_and_layout();
-            let ctrs_cuda = match &*ctrs_storage {
-                Storage::Cuda(cs) => cs,
-                _ => candle::bail!("workspace must be cuda"),
-            };
-            let ctrs_slice = ctrs_cuda
-                .as_cuda_slice::<u32>()?
-                .slice(ctrs_layout.start_offset()..);
-            let (ctrs_devptr, _) = ctrs_slice.device_ptr(stream_ref);
+            let (counts_devptr, _) = expert_counts.device_ptr(stream_ref);
+            let (offsets_devptr, _) = expert_offsets.device_ptr(stream_ref);
+            let (tids_devptr, _) = token_ids.device_ptr(stream_ref);
+            let (sids_devptr, _) = select_ids.device_ptr(stream_ref);
+            let (ctrs_devptr, _) = counters.device_ptr(stream_ref);
+            let (blkoffs_devptr, _) = block_offsets.device_ptr(stream_ref);
 
             unsafe {
                 ffi::fused_moe_auto(
@@ -517,6 +476,7 @@ impl FusedMoE {
                     num_tokens as i32,
                     hidden_dim as i32,
                     intermediate_dim as i32,
+                    self.num_experts as i32,
                     self.num_selected_experts as i32,
                     self.activation.to_int(),
                     moe_type,
@@ -526,6 +486,7 @@ impl FusedMoE {
                     tids_devptr as usize as *mut core::ffi::c_int,
                     sids_devptr as usize as *mut core::ffi::c_int,
                     ctrs_devptr as usize as *mut core::ffi::c_int,
+                    blkoffs_devptr as usize as *mut core::ffi::c_int,
                 );
             }
         } else {
