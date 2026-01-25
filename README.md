@@ -61,7 +61,7 @@ let moe_act = match activation {
     _ => candle::bail!("not supported activation type"),
 };
 
-let fused_moe = candle_moe::FusedMoeForward::new(num_experts, top_k, moe_act);
+let fused_moe = candle_moe::FusedMoE::new(num_experts, top_k, moe_act);
 
 ...
 
