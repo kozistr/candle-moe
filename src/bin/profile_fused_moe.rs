@@ -7,7 +7,7 @@ use std::os::raw::c_char;
 // NVTX FFI
 // =============================
 #[link(name = "nvToolsExt")]
-extern "C" {
+unsafe extern "C" {
     fn nvtxRangePushA(msg: *const c_char) -> i32;
     fn nvtxRangePop() -> i32;
 }
