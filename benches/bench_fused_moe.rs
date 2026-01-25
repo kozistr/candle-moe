@@ -1,6 +1,7 @@
 use candle::{D, DType, Device, IndexOp, Result, Tensor};
 use candle_transformers::models::deepseek2::{BincountOp, NonZeroOp};
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
+use std::hint::black_box;
 
 fn forward_moe_router(
     weights: &Tensor,
@@ -82,22 +83,13 @@ fn setup_tensors(
     top_k: usize,
     n_embed: usize,
     dtype: DType,
-) -> Result<(
-    Tensor,
-    Tensor,
-    Tensor,
-    Tensor,
-    Tensor,
-    Tensor,
-    candle_moe::FusedMoE,
-)> {
+) -> Result<(Tensor, Tensor, Tensor, Tensor, Tensor, candle_moe::FusedMoE)> {
     let device = Device::new_cuda(0)?;
 
     let n_inner = n_embed * 4;
 
     let hidden_states = Tensor::randn(0.0, 1.0, (seq_len, n_embed), &device)?.to_dtype(dtype)?;
-    let weights = Tensor::randn(0.0, 1.0, (seq_len, num_experts), &device)?.to_dtype(dtype)?;
-    let fused_moe_output = Tensor::zeros_like(&hidden_states)?;
+    let weights = Tensor::randn(0.0, 1.0, (seq_len, num_experts), &device)?.to_dtype(DType::F32)?;
 
     let (scores, indices) = forward_moe_router(&weights, seq_len, top_k, &device)?;
 
@@ -118,7 +110,6 @@ fn setup_tensors(
         up_weights,
         scores,
         indices,
-        fused_moe_output,
         fused_moe,
     ))
 }
@@ -132,7 +123,7 @@ fn run_benchmark(
     n_embed: usize,
     dtype: DType,
 ) {
-    let (hidden_states, gate_weights, up_weights, scores, indices, fused_moe_output, fused_moe) =
+    let (hidden_states, gate_weights, up_weights, scores, indices, fused_moe) =
         match setup_tensors(seq_len, num_experts, top_k, n_embed, dtype) {
             Ok(t) => t,
             Err(e) => {
@@ -147,7 +138,7 @@ fn run_benchmark(
     let mut group = c.benchmark_group(group_name);
     group.sample_size(500);
     group.warm_up_time(std::time::Duration::from_millis(1500));
-    group.measurement_time(std::time::Duration::from_millis(10000));
+    group.measurement_time(std::time::Duration::from_millis(15000));
 
     // native warmup
     let _ = forward_moe_expert(
@@ -180,7 +171,7 @@ fn run_benchmark(
     });
 
     // custom warmup
-    fused_moe
+    let _ = fused_moe
         .forward(
             &hidden_states,
             &gate_weights,
@@ -188,14 +179,13 @@ fn run_benchmark(
             None,
             &scores,
             &indices,
-            &fused_moe_output,
             1_u32,
         )
         .unwrap();
 
     group.bench_function("custom_f32", |b| {
         b.iter(|| {
-            black_box(
+            let fused_moe_output = black_box(
                 fused_moe
                     .forward(
                         &hidden_states,
@@ -204,7 +194,6 @@ fn run_benchmark(
                         None,
                         &scores,
                         &indices,
-                        &fused_moe_output,
                         1_u32,
                     )
                     .unwrap(),
@@ -253,7 +242,7 @@ fn run_benchmark(
     };
 
     let mut custom_f32 = || {
-        fused_moe
+        let fused_moe_output = fused_moe
             .forward(
                 &hidden_states,
                 &gate_weights,
@@ -261,7 +250,6 @@ fn run_benchmark(
                 None,
                 &scores,
                 &indices,
-                &fused_moe_output,
                 1_u32,
             )
             .unwrap();
@@ -281,26 +269,26 @@ fn run_benchmark(
 }
 
 fn bench_fused_moe(c: &mut Criterion) {
-    run_benchmark(c, "fused_moe_short_seq_f32", 32, 8, 2, 1024, DType::F32);
-    run_benchmark(c, "topk_softmax_mid_seq_f32", 512, 8, 2, 1024, DType::F32);
-    run_benchmark(c, "topk_softmax_long_seq_f32", 8192, 8, 2, 1024, DType::F32);
+    run_benchmark(c, "fused_moe_short_seq_f32", 32, 8, 2, 256, DType::F32);
+    run_benchmark(c, "topk_softmax_mid_seq_f32", 512, 8, 2, 256, DType::F32);
+    run_benchmark(c, "topk_softmax_long_seq_f32", 8192, 8, 2, 256, DType::F32);
     run_benchmark(
         c,
         "topk_softmax_very_long_seq_f32",
         32768,
         8,
         2,
-        1024,
+        256,
         DType::F32,
     );
-    run_benchmark(c, "topk_softmax_long_seq_f16", 8192, 8, 2, 1024, DType::F16);
+    run_benchmark(c, "topk_softmax_long_seq_f16", 8192, 8, 2, 256, DType::F16);
     run_benchmark(
         c,
         "topk_softmax_very_long_seq_f16",
         32768,
         8,
         2,
-        1024,
+        256,
         DType::F16,
     );
 }

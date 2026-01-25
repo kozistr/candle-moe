@@ -3,7 +3,7 @@ use core::ffi::{c_int, c_void};
 unsafe extern "C" {
     pub(crate) fn topk_softmax(
         gating_output: *const c_void,
-        topk_weight: *const c_void,
+        topk_weight: *mut c_void,
         topk_indices: *const c_void,
         token_expert_indices: *const c_void,
 
@@ -19,7 +19,7 @@ unsafe extern "C" {
         down_weights: *const c_void,
         routing_weights: *const c_void,
         expert_indices: *const c_void,
-        output: *const c_void,
+        output: *mut c_void,
         num_tokens: i32,
         hidden_dim: i32,
         intermediate_dim: i32,

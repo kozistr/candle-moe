@@ -1,6 +1,7 @@
 use candle::{DType, Device, Result, Tensor};
 use candle_transformers::models::deepseek2::{TopKLastDimOp, TopKOutput};
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
+use std::hint::black_box;
 
 fn setup_tensors(
     seq_len: usize,

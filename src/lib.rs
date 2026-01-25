@@ -1,10 +1,11 @@
 pub mod ffi;
 
+pub use candle;
+use candle::backend::BackendStorage;
 use candle::cuda_backend::cudarc::driver::DevicePtr;
-use candle::{CudaStorage, DType, Layout, Result, Storage, Tensor};
+use candle::{DType, Result, Storage, Tensor};
 use half::{bf16, f16};
 use std::ptr;
-use std::sync::RwLockReadGuard;
 
 pub fn apply_topk_softmax_<
     T: candle::cuda_backend::CudaDType + candle::cuda_backend::cudarc::driver::DeviceRepr,
@@ -37,6 +38,10 @@ pub fn apply_topk_softmax_<
         Storage::Cuda(ei) => ei,
         _ => candle::bail!("token_expert_indices must be a cuda tensor"),
     };
+
+    let device = g.device();
+    let stream = device.cuda_stream();
+    let stream_ref = stream.as_ref();
 
     let g_rank = g_l.stride().len();
     let w_rank = w_l.stride().len();
@@ -87,10 +92,17 @@ pub fn apply_topk_softmax_<
         )
     }
 
-    let gate_ptr = *g.device_ptr() as *const core::ffi::c_void;
-    let weight_ptr = *w.device_ptr() as *const core::ffi::c_void;
-    let indices_ptr = *i.device_ptr() as *const core::ffi::c_void;
-    let expert_indices_ptr = *ei.device_ptr() as *const core::ffi::c_void;
+    let (gate_devptr, _) = g.device_ptr(stream_ref);
+    let gate_ptr = gate_devptr as usize as *const core::ffi::c_void;
+
+    let (weight_devptr, _) = w.device_ptr(stream_ref);
+    let weight_ptr = weight_devptr as usize as *mut core::ffi::c_void;
+
+    let (indices_devptr, _) = i.device_ptr(stream_ref);
+    let indices_ptr = indices_devptr as usize as *const core::ffi::c_void;
+
+    let (expert_indices_devptr, _) = ei.device_ptr(stream_ref);
+    let expert_indices_ptr = expert_indices_devptr as usize as *const core::ffi::c_void;
 
     unsafe {
         ffi::topk_softmax(
@@ -178,7 +190,7 @@ fn validate_moe_inputs(
     num_experts: usize,
     num_selected_experts: usize,
     moe_type: u32,
-) -> Result<(usize, usize, usize)> {
+) -> Result<(usize, usize)> {
     let (num_tokens, hidden_dim) = input.dims2()?;
     let (ne_g, hd_g, id_g) = gate_weights.dims3()?;
     let (ne_u, hd_u, id_u) = up_weights.dims3()?;
@@ -224,218 +236,7 @@ fn validate_moe_inputs(
         candle::bail!("moe_type must be one of 0 or 1");
     }
 
-    Ok((num_tokens, hidden_dim, id_g))
-}
-
-// =============================================================================
-// cudarc 0.16+ API (candle 0.9+)
-// =============================================================================
-#[cfg(feature = "cuda-12")]
-mod cuda_impl {
-    use super::*;
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn fwd_impl<
-        T: candle::cuda_backend::CudaDType + candle::cuda_backend::cudarc::driver::DeviceRepr,
-    >(
-        input_storage: &CudaStorage,
-        input_layout: &Layout,
-        gate_storage: &CudaStorage,
-        gate_layout: &Layout,
-        up_storage: &CudaStorage,
-        up_layout: &Layout,
-        down: (Option<RwLockReadGuard<'_, Storage>>, Option<&Layout>),
-        routing_storage: &CudaStorage,
-        routing_layout: &Layout,
-        indices_storage: &CudaStorage,
-        indices_layout: &Layout,
-        output_storage: &CudaStorage,
-        output_layout: &Layout,
-        moe_type: u32,
-        num_tokens: usize,
-        hidden_dim: usize,
-        intermediate_dim: usize,
-        num_selected_experts: usize,
-        activation: i32,
-        dtype: u32,
-    ) -> Result<Tensor> {
-        let dev = input_storage.device();
-        let stream = dev.cuda_stream();
-        let stream_ref = stream.as_ref();
-
-        let input_slice = input_storage
-            .as_cuda_slice::<T>()?
-            .slice(input_layout.start_offset()..);
-        let gate_slice = gate_storage
-            .as_cuda_slice::<T>()?
-            .slice(gate_layout.start_offset()..);
-        let up_slice = up_storage
-            .as_cuda_slice::<T>()?
-            .slice(up_layout.start_offset()..);
-        let routing_slice = routing_storage
-            .as_cuda_slice::<f32>()?
-            .slice(routing_layout.start_offset()..);
-        let indices_slice = indices_storage
-            .as_cuda_slice::<u32>()?
-            .slice(indices_layout.start_offset()..);
-        let output_slice = output_storage
-            .as_cuda_slice::<T>()?
-            .slice(output_layout.start_offset()..);
-
-        let down_slice: Option<&CudaView<T>> = if let (Some(down_storage), Some(down_layout)) = down
-        {
-            let down_storage = match &*down_storage {
-                Storage::Cuda(cuda_storage) => cuda_storage,
-                _ => candle::bail!("down_weights must be a cuda tensor"),
-            };
-
-            let down_slice = down_storage
-                .as_cuda_slice::<T>()?
-                .slice(down_layout.start_offset()..);
-
-            Some(&down_slice)
-        } else {
-            None
-        };
-
-        let (input_devptr, _) = input_slice.device_ptr(stream_ref);
-        let input_ptr = input_devptr as usize as *const core::ffi::c_void;
-
-        let (gate_devptr, _) = gate_slice.device_ptr(stream_ref);
-        let gate_ptr = gate_devptr as usize as *const core::ffi::c_void;
-
-        let (up_devptr, _) = up_slice.device_ptr(stream_ref);
-        let up_ptr = up_devptr as usize as *const core::ffi::c_void;
-
-        let (routing_devptr, _) = routing_slice.device_ptr(stream_ref);
-        let routing_ptr = routing_devptr as usize as *const core::ffi::c_void;
-
-        let indices_ptr = *indices_slice.device_ptr() as usize as *const core::ffi::c_void;
-        let output_ptr = *output_slice.device_ptr() as usize as *const core::ffi::c_void;
-
-        let down_ptr = if let Some(ds) = down_slice {
-            let (down_devptr, _) = ds.device_ptr(stream_ref);
-            down_devptr as usize as *const core::ffi::c_void
-        } else {
-            ptr::null()
-        };
-
-        unsafe {
-            ffi::fused_moe(
-                input_ptr,
-                gate_ptr,
-                up_ptr,
-                down_ptr,
-                routing_ptr,
-                indices_ptr,
-                output_ptr,
-                num_tokens as i32,
-                hidden_dim as i32,
-                intermediate_dim as i32,
-                num_selected_experts as i32,
-                activation,
-                moe_type,
-                dtype,
-            );
-        }
-
-        Ok(())
-    }
-}
-
-// =============================================================================
-// Legacy cudarc API (candle pre-0.9)
-// =============================================================================
-#[cfg(feature = "cuda-11")]
-mod cuda_impl {
-    use super::*;
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn fwd_impl<
-        T: candle::cuda_backend::CudaDType + candle::cuda_backend::cudarc::driver::DeviceRepr,
-    >(
-        input_storage: &CudaStorage,
-        input_layout: &Layout,
-        gate_storage: &CudaStorage,
-        gate_layout: &Layout,
-        up_storage: &CudaStorage,
-        up_layout: &Layout,
-        down: (Option<RwLockReadGuard<'_, Storage>>, Option<&Layout>),
-        routing_storage: &CudaStorage,
-        routing_layout: &Layout,
-        indices_storage: &CudaStorage,
-        indices_layout: &Layout,
-        output_storage: &CudaStorage,
-        output_layout: &Layout,
-        moe_type: u32,
-        num_tokens: usize,
-        hidden_dim: usize,
-        intermediate_dim: usize,
-        num_selected_experts: usize,
-        activation: i32,
-        dtype: u32,
-    ) -> Result<()> {
-        let input_slice = input_storage
-            .as_cuda_slice::<T>()?
-            .slice(input_layout.start_offset()..);
-        let gate_slice = gate_storage
-            .as_cuda_slice::<T>()?
-            .slice(gate_layout.start_offset()..);
-        let up_slice = up_storage
-            .as_cuda_slice::<T>()?
-            .slice(up_layout.start_offset()..);
-        let routing_slice = routing_storage
-            .as_cuda_slice::<f32>()?
-            .slice(routing_layout.start_offset()..);
-        let indices_slice = indices_storage
-            .as_cuda_slice::<u32>()?
-            .slice(indices_layout.start_offset()..);
-        let output_slice = output_storage
-            .as_cuda_slice::<T>()?
-            .slice(output_layout.start_offset()..);
-
-        let input_ptr = *input_slice.device_ptr() as *const core::ffi::c_void;
-        let gate_ptr = *gate_slice.device_ptr() as *const core::ffi::c_void;
-        let up_ptr = *up_slice.device_ptr() as *const core::ffi::c_void;
-        let routing_ptr = *routing_slice.device_ptr() as *const core::ffi::c_void;
-        let indices_ptr = *indices_slice.device_ptr() as *const core::ffi::c_void;
-        let output_ptr = *output_slice.device_ptr() as *const core::ffi::c_void;
-
-        let down_ptr = if let (Some(down_storage), Some(down_layout)) = down {
-            let down_storage = match &*down_storage {
-                Storage::Cuda(cuda_storage) => cuda_storage,
-                _ => candle::bail!("down_weights must be a cuda tensor"),
-            };
-
-            *down_storage
-                .as_cuda_slice::<T>()?
-                .slice(down_layout.start_offset()..)
-                .device_ptr() as *const core::ffi::c_void
-        } else {
-            ptr::null()
-        };
-
-        unsafe {
-            ffi::fused_moe(
-                input_ptr,
-                gate_ptr,
-                up_ptr,
-                down_ptr,
-                routing_ptr,
-                indices_ptr,
-                output_ptr,
-                num_tokens as i32,
-                hidden_dim as i32,
-                intermediate_dim as i32,
-                num_selected_experts as i32,
-                activation,
-                moe_type,
-                dtype,
-            );
-        }
-
-        Ok(())
-    }
+    Ok((num_tokens, hidden_dim))
 }
 
 pub struct FusedMoE {
@@ -461,8 +262,10 @@ impl FusedMoE {
     /// - down_weights: [num_experts, intermediate_dim, hidden_dim]
     /// - routing_weights: [num_tokens, num_selected_experts]
     /// - expert_indices: [num_tokens, num_selected_experts]
-    /// - output: [num_tokens, hidden_dim]
     /// - moe_type: qwen3: 0, nomic: 1
+    ///
+    /// Returns:
+    /// - output tensor: [num_tokens, hidden_dim]
     #[allow(clippy::too_many_arguments)]
     pub fn forward(
         &self,
@@ -472,10 +275,9 @@ impl FusedMoE {
         down_weights: Option<&Tensor>,
         routing_weights: &Tensor,
         expert_indices: &Tensor,
-        output: &Tensor,
         moe_type: u32,
-    ) -> Result<()> {
-        let (num_tokens, hidden_dim, intermediate_dim) = validate_moe_inputs(
+    ) -> Result<Tensor> {
+        let (num_tokens, hidden_dim) = validate_moe_inputs(
             input,
             gate_weights,
             up_weights,
@@ -486,6 +288,65 @@ impl FusedMoE {
             self.num_selected_experts,
             moe_type,
         )?;
+
+        let dtype = input.dtype();
+        let output = Tensor::zeros((num_tokens, hidden_dim), dtype, input.device())?;
+
+        _ = match dtype {
+            DType::F16 => self.cuda_fwd::<f16>(
+                input,
+                gate_weights,
+                up_weights,
+                down_weights,
+                routing_weights,
+                expert_indices,
+                moe_type,
+                &output,
+            ),
+            DType::BF16 => self.cuda_fwd::<bf16>(
+                input,
+                gate_weights,
+                up_weights,
+                down_weights,
+                routing_weights,
+                expert_indices,
+                moe_type,
+                &output,
+            ),
+            DType::F32 => self.cuda_fwd::<f32>(
+                input,
+                gate_weights,
+                up_weights,
+                down_weights,
+                routing_weights,
+                expert_indices,
+                moe_type,
+                &output,
+            ),
+            dt => {
+                candle::bail!("FusedMoE is only supported for f16, bf16 and f32 ({dt:?})")
+            }
+        };
+
+        Ok(output)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn cuda_fwd<
+        T: candle::cuda_backend::CudaDType + candle::cuda_backend::cudarc::driver::DeviceRepr,
+    >(
+        &self,
+        input: &Tensor,
+        gate_weights: &Tensor,
+        up_weights: &Tensor,
+        down_weights: Option<&Tensor>,
+        routing_weights: &Tensor,
+        expert_indices: &Tensor,
+        moe_type: u32,
+        output: &Tensor,
+    ) -> Result<()> {
+        let (num_tokens, hidden_dim) = input.dims2()?;
+        let (_, _, intermediate_dim) = gate_weights.dims3()?;
 
         // Get storage and layouts
         let (input_storage, input_layout) = input.storage_and_layout();
@@ -521,86 +382,85 @@ impl FusedMoE {
             _ => candle::bail!("output must be a cuda tensor"),
         };
 
-        let down = if let Some(dw) = down_weights {
+        let device = indices_cuda.device();
+        let stream = device.cuda_stream();
+        let stream_ref = stream.as_ref();
+
+        let input_slice = input_cuda
+            .as_cuda_slice::<T>()?
+            .slice(input_layout.start_offset()..);
+        let gate_slice = gate_cuda
+            .as_cuda_slice::<T>()?
+            .slice(gate_layout.start_offset()..);
+        let up_slice = up_cuda
+            .as_cuda_slice::<T>()?
+            .slice(up_layout.start_offset()..);
+        let routing_slice = routing_cuda
+            .as_cuda_slice::<f32>()?
+            .slice(routing_layout.start_offset()..);
+        let indices_slice = indices_cuda
+            .as_cuda_slice::<u32>()?
+            .slice(indices_layout.start_offset()..);
+        let output_slice = output_cuda
+            .as_cuda_slice::<T>()?
+            .slice(output_layout.start_offset()..);
+
+        let (input_devptr, _) = input_slice.device_ptr(stream_ref);
+        let input_ptr = input_devptr as usize as *const core::ffi::c_void;
+
+        let (gate_devptr, _) = gate_slice.device_ptr(stream_ref);
+        let gate_ptr = gate_devptr as usize as *const core::ffi::c_void;
+
+        let (up_devptr, _) = up_slice.device_ptr(stream_ref);
+        let up_ptr = up_devptr as usize as *const core::ffi::c_void;
+
+        let (routing_devptr, _) = routing_slice.device_ptr(stream_ref);
+        let routing_ptr = routing_devptr as usize as *const core::ffi::c_void;
+
+        let (indices_devptr, _) = indices_slice.device_ptr(stream_ref);
+        let indices_ptr = indices_devptr as usize as *const core::ffi::c_void;
+
+        let (output_devptr, _) = output_slice.device_ptr(stream_ref);
+        let output_ptr = output_devptr as usize as *mut core::ffi::c_void;
+
+        let down_ptr = if let Some(dw) = down_weights {
             let (down_storage, down_layout) = dw.storage_and_layout();
-            (Some(down_storage), Some(down_layout))
+
+            let down_cuda = match &*down_storage {
+                Storage::Cuda(cuda_storage) => cuda_storage,
+                _ => candle::bail!("down_weights must be a cuda tensor"),
+            };
+
+            let down_slice = down_cuda
+                .as_cuda_slice::<T>()?
+                .slice(down_layout.start_offset()..);
+
+            let (down_devptr, _) = down_slice.device_ptr(stream_ref);
+            down_devptr as usize as *const core::ffi::c_void
         } else {
-            (None, None)
+            ptr::null()
         };
 
         let dtype = fused_moe_internal_dtype(input.dtype())?;
 
-        _ = match input.dtype() {
-            DType::F16 => cuda_impl::fwd_impl::<f16>(
-                input_cuda,
-                input_layout,
-                gate_cuda,
-                gate_layout,
-                up_cuda,
-                up_layout,
-                down,
-                routing_cuda,
-                routing_layout,
-                indices_cuda,
-                indices_layout,
-                output_cuda,
-                output_layout,
-                moe_type,
-                num_tokens,
-                hidden_dim,
-                intermediate_dim,
-                self.num_selected_experts,
+        unsafe {
+            ffi::fused_moe(
+                input_ptr,
+                gate_ptr,
+                up_ptr,
+                down_ptr,
+                routing_ptr,
+                indices_ptr,
+                output_ptr,
+                num_tokens as i32,
+                hidden_dim as i32,
+                intermediate_dim as i32,
+                self.num_selected_experts as i32,
                 self.activation.to_int(),
-                dtype,
-            ),
-            DType::BF16 => cuda_impl::fwd_impl::<bf16>(
-                input_cuda,
-                input_layout,
-                gate_cuda,
-                gate_layout,
-                up_cuda,
-                up_layout,
-                down,
-                routing_cuda,
-                routing_layout,
-                indices_cuda,
-                indices_layout,
-                output_cuda,
-                output_layout,
                 moe_type,
-                num_tokens,
-                hidden_dim,
-                intermediate_dim,
-                self.num_selected_experts,
-                self.activation.to_int(),
                 dtype,
-            ),
-            DType::F32 => cuda_impl::fwd_impl::<f32>(
-                input_cuda,
-                input_layout,
-                gate_cuda,
-                gate_layout,
-                up_cuda,
-                up_layout,
-                down,
-                routing_cuda,
-                routing_layout,
-                indices_cuda,
-                indices_layout,
-                output_cuda,
-                output_layout,
-                moe_type,
-                num_tokens,
-                hidden_dim,
-                intermediate_dim,
-                self.num_selected_experts,
-                self.activation.to_int(),
-                dtype,
-            ),
-            dt => {
-                candle::bail!("FusedMoE is only supported for f16, bf16 and f32 ({dt:?})")
-            }
-        };
+            );
+        }
 
         Ok(())
     }

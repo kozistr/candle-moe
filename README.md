@@ -4,9 +4,9 @@ Fast CUDA `fused MoE` for [Candle](https://github.com/huggingface/candle) backen
 
 ## Benchmark
 
-vs `candle 0.8` native kernels / `topk-softmax kernel`
+vs `candle 0.9.1` native kernels / `topk-softmax kernel`
 
-| seq_len | num_experts | top k | candle 0.8 | candle-moe | speed-up |
+| seq_len | num_experts | top k | candle 0.9 | candle-moe | speed-up |
 |  :---:  | :---:       | :---: |  :---:     | :---:      | :---:    |
 | 32      | 8           | 2     | 466.459 µs | 28.358 µs  | 16.45x   |
 | 512     | 8           | 2     | 127.168 µs | 26.034 µs  | 4.88x    |
@@ -15,14 +15,16 @@ vs `candle 0.8` native kernels / `topk-softmax kernel`
 
 Benchmarks run on GTX 1060 6GB
 
-vs `candle 0.8` native kernels / `fused MoE kernel`
+vs `candle 0.9.1` native kernels / `fused MoE kernel`
 
-| seq_len | num_experts | top k | candle 0.8 | candle-moe | speed-up |
-|  :---:  | :---:       | :---: |  :---:     | :---:      | :---:    |
-| 32      | 8           | 2     | 466.459 µs | 28.358 µs  | 16.45x   |
-| 512     | 8           | 2     | 127.168 µs | 26.034 µs  | 4.88x    |
-| 8192    | 8           | 2     | 497.787 µs | 29.097 µs  | 17.11x   |
-| 32768   | 8           | 2     | 625.476 µs | 30.650 µs  | 20.41x   |
+|  fp   | seq_len | num_experts | top k | candle 0.9 | candle-moe | speed-up |
+| :---: |  :---:  | :---:       | :---: |  :---:     | :---:      | :---:    |
+| fp32  | 32      | 8           | 2     | 3.772 ms   | 36.839 µs  | 102.40x  |
+| fp32  | 512     | 8           | 2     | 4.058 ms   | 39.022 µs  | 103.99x  |
+| fp32  | 8192    | 8           | 2     | 21.342 ms  | 76.588 µs  | 278.66x  |
+| fp32  | 32768   | 8           | 2     | 72.280 ms  | 256.842 µs | 281.42x  |
+| fp16  | 8192    | 8           | 2     | 21.342 ms  | 76.588 µs  | 278.66x  |
+| fp16  | 32768   | 8           | 2     | 72.280 ms  | 256.842 µs | 281.42x  |
 
 Benchmarks run on GTX 1060 6GB
 
@@ -72,28 +74,4 @@ let mut out = self.fused_moe.forward(
     &top_experts,
     1_u32, // Nomic MoE
 )?;
-```
-
-## Feature Flags
-
-This crate supports both older and newer versions of candle/cudarc:
-
-|  Feature  |      Candle Version     | cudarc Version | Default |
-|   :---:   |          :---:          |       :---:    |  :---:  |
-| `cuda-12` | 0.9+                    | 0.16+          |   ✅    |
-| `cuda-11` | pre-0.9 (0.6, 0.7, 0.8) | pre-0.16       |         |
-
-
-### For candle 0.9+
-
-```toml
-[dependencies]
-candle-moe = { git = "https://github.com/kozistr/candle-moe", rev = "990ac1f42248dd441c51c9b5bcb73c5b77c03f99", features = ["cuda-12"] }
-```
-
-### For older versions (<0.9)
-
-```toml
-[dependencies]
-candle-moe = { git = "https://github.com/kozistr/candle-moe", rev = "990ac1f42248dd441c51c9b5bcb73c5b77c03f99", default-features = false, features = ["cuda-11"] }
 ```

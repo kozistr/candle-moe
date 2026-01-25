@@ -5,7 +5,7 @@ use candle_transformers::models::deepseek2::{BincountOp, NonZeroOp};
 #[allow(dead_code)]
 fn to_vec2_round(t: Tensor, digits: i32) -> Result<Vec<Vec<f32>>> {
     let b = 10f32.powi(digits);
-    let t = t.to_vec2::<f32>()?;
+    let t = t.to_dtype(DType::F32)?.to_vec2::<f32>()?;
     let t = t
         .iter()
         .map(|row| {
@@ -92,40 +92,28 @@ fn forward_moe_expert(
 fn fused_moe() -> Result<()> {
     let device = Device::new_cuda(0)?;
 
+    let dtype = DType::F32;
     let n_embed = 16;
     let n_inner = n_embed * 4;
     let seq_len = 16;
     let num_experts = 8;
     let top_k = 2;
 
-    let hidden_states =
-        Tensor::randn(0.0, 1.0, (seq_len, n_embed), &device)?.to_dtype(DType::F32)?;
+    let hidden_states = Tensor::randn(0.0, 1.0, (seq_len, n_embed), &device)?.to_dtype(dtype)?;
     let weights = Tensor::randn(0.0, 1.0, (seq_len, num_experts), &device)?.to_dtype(DType::F32)?;
-    let fused_moe_output = Tensor::zeros_like(&hidden_states)?;
 
     let (scores, indices) = forward_moe_router(&weights, seq_len, top_k, &device)?;
 
     let gate_weights =
-        Tensor::randn(0.0, 1.0, (num_experts, n_embed, n_inner), &device)?.to_dtype(DType::F32)?;
+        Tensor::randn(0.0, 1.0, (num_experts, n_embed, n_inner), &device)?.to_dtype(dtype)?;
     let up_weights =
-        Tensor::randn(0.0, 1.0, (num_experts, n_embed, n_inner), &device)?.to_dtype(DType::F32)?;
+        Tensor::randn(0.0, 1.0, (num_experts, n_embed, n_inner), &device)?.to_dtype(dtype)?;
 
     let fused_moe = candle_moe::FusedMoE {
         num_experts: gate_weights.dim(0)?,
         num_selected_experts: top_k,
         activation: candle_moe::Activation::Silu,
     };
-
-    fused_moe.forward(
-        &hidden_states,
-        &gate_weights,
-        &up_weights,
-        None,
-        &scores,
-        &indices,
-        &fused_moe_output,
-        1_u32,
-    )?;
 
     let naive_moe_output = forward_moe_expert(
         &hidden_states,
@@ -137,9 +125,19 @@ fn fused_moe() -> Result<()> {
         num_experts,
     )?;
 
+    let fused_moe_output = fused_moe.forward(
+        &hidden_states,
+        &gate_weights,
+        &up_weights,
+        None,
+        &scores,
+        &indices,
+        1_u32,
+    )?;
+
     assert_eq!(
+        to_vec2_round(naive_moe_output, 3)?,
         to_vec2_round(fused_moe_output, 3)?,
-        to_vec2_round(naive_moe_output, 3)?
     );
 
     Ok(())

@@ -414,9 +414,9 @@ __global__ void optimized_fused_moe_kernel(
 
 // Kernel to sort tokens by expert for better data locality
 __global__ void prepare_sorted_pairs(
-    const uint32_t* expert_indices,    // [num_tokens, num_selected_experts]
+    const uint32_t* expert_indices,     // [num_tokens, num_selected_experts]
     const float* routing_weights,       // [num_tokens, num_selected_experts]
-    TokenExpertPair* sorted_pairs,     // Output: sorted pairs
+    TokenExpertPair* sorted_pairs,      // Output: sorted pairs
     int* expert_counts,                 // Output: count per expert
     int num_tokens,
     int num_selected_experts
