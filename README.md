@@ -2,6 +2,11 @@
 
 Fast CUDA `fused MoE` for [Candle](https://github.com/huggingface/candle) backend.
 
+## Requirements
+
+* SM80+ GPU (e.g. A40)
+* `Candle 0.9+`
+
 ## Benchmark
 
 vs `candle 0.9.1` native kernels / `topk-softmax kernel`
