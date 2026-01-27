@@ -4,7 +4,7 @@ Fast CUDA `fused MoE` for [Candle](https://github.com/huggingface/candle) backen
 
 ## Requirements
 
-* SM80+ GPU (e.g. A40)
+* SM 7.0+ (Volta+) GPU (e.g. A40)
 * `Candle 0.9+`
 
 ## Benchmark
