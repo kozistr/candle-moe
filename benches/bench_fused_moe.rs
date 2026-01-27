@@ -269,26 +269,26 @@ fn run_benchmark(
 }
 
 fn bench_fused_moe(c: &mut Criterion) {
-    run_benchmark(c, "fused_moe_short_seq_f32", 32, 8, 2, 256, DType::F32);
-    run_benchmark(c, "fused_moe_mid_seq_f32", 512, 8, 2, 256, DType::F32);
-    run_benchmark(c, "fused_moe_long_seq_f32", 8192, 8, 2, 256, DType::F32);
+    run_benchmark(c, "nomic_moe_short_seq_f32", 32, 8, 2, 768, DType::F32);
+    run_benchmark(c, "nomic_moe_mid_seq_f32", 512, 8, 2, 768, DType::F32);
+    run_benchmark(c, "nomic_moe_long_seq_f32", 8192, 8, 2, 768, DType::F32);
     run_benchmark(
         c,
-        "fused_moe_very_long_seq_f32",
+        "nomic_moe_very_long_seq_f32",
         32768,
         8,
         2,
         256,
         DType::F32,
     );
-    run_benchmark(c, "fused_moe_long_seq_f16", 8192, 8, 2, 256, DType::F16);
+    run_benchmark(c, "nomic_moe_long_seq_f16", 8192, 8, 2, 768, DType::F16);
     run_benchmark(
         c,
-        "fused_moe_very_long_seq_f16",
+        "nomic_moe_very_long_seq_f16",
         32768,
         8,
         2,
-        256,
+        768,
         DType::F16,
     );
 }

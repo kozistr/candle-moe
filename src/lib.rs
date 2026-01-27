@@ -42,6 +42,7 @@ pub fn apply_topk_softmax_<
     let device = g.device();
     let stream = device.cuda_stream();
     let stream_ref = stream.as_ref();
+    let stream_ptr = stream_ref.cu_stream() as *mut core::ffi::c_void;
 
     let g_rank = g_l.stride().len();
     let w_rank = w_l.stride().len();
@@ -113,6 +114,7 @@ pub fn apply_topk_softmax_<
             num_experts as i32,
             num_tokens as i32,
             top_k as i32,
+            stream_ptr,
         )
     }
 
@@ -292,7 +294,7 @@ impl FusedMoE {
         let dtype = input.dtype();
         let output = Tensor::zeros((num_tokens, hidden_dim), dtype, input.device())?;
 
-        _ = match dtype {
+        match dtype {
             DType::F16 => self.cuda_fwd::<f16>(
                 input,
                 gate_weights,
@@ -302,7 +304,7 @@ impl FusedMoE {
                 expert_indices,
                 moe_type,
                 &output,
-            ),
+            )?,
             DType::BF16 => self.cuda_fwd::<bf16>(
                 input,
                 gate_weights,
@@ -312,7 +314,7 @@ impl FusedMoE {
                 expert_indices,
                 moe_type,
                 &output,
-            ),
+            )?,
             DType::F32 => self.cuda_fwd::<f32>(
                 input,
                 gate_weights,
@@ -322,7 +324,7 @@ impl FusedMoE {
                 expert_indices,
                 moe_type,
                 &output,
-            ),
+            )?,
             dt => {
                 candle::bail!("FusedMoE is only supported for f16, bf16 and f32 ({dt:?})")
             }
@@ -385,6 +387,7 @@ impl FusedMoE {
         let device = indices_cuda.device();
         let stream = device.cuda_stream();
         let stream_ref = stream.as_ref();
+        let stream_ptr = stream_ref.cu_stream() as *mut core::ffi::c_void;
 
         let input_slice = input_cuda
             .as_cuda_slice::<T>()?
@@ -445,27 +448,29 @@ impl FusedMoE {
 
         // Use expert-parallel kernel for large batches (much faster due to weight reuse)
         if num_tokens >= 16 {
-            // Allocate workspace buffers for expert-parallel processing.
-            // Using U32 which maps to 32-bit integers expected by C interface.
+            // Allocate workspace buffers for expert-parallel processing
+            // All buffers are uninitialized - the CUDA kernel zeros them to avoid memset API overhead
             let total_assignments = num_tokens * self.num_selected_experts;
             let cuda_dev = input_cuda.device();
 
-            let expert_counts = cuda_dev.alloc_zeros::<u32>(self.num_experts)?;
-            let counters = cuda_dev.alloc_zeros::<u32>(self.num_experts)?;
+            let expert_counts = unsafe { cuda_dev.alloc::<u32>(self.num_experts)? };
+            let counters = unsafe { cuda_dev.alloc::<u32>(self.num_experts)? };
             let expert_offsets = unsafe { cuda_dev.alloc::<u32>(self.num_experts + 1)? };
-            let block_offsets = unsafe { cuda_dev.alloc::<u32>(self.num_experts + 1)? };
             let token_ids = unsafe { cuda_dev.alloc::<u32>(total_assignments)? };
-            let select_ids = unsafe { cuda_dev.alloc::<u32>(total_assignments)? };
+            let sorted_routing_weights = unsafe { cuda_dev.alloc::<f32>(total_assignments)? };
+            // Intermediate buffer stores act(gate) * up: [total_assignments, intermediate_dim]
+            let intermediate_buffer =
+                unsafe { cuda_dev.alloc::<f32>(total_assignments * intermediate_dim)? };
 
             let (counts_devptr, _) = expert_counts.device_ptr(stream_ref);
             let (offsets_devptr, _) = expert_offsets.device_ptr(stream_ref);
             let (tids_devptr, _) = token_ids.device_ptr(stream_ref);
-            let (sids_devptr, _) = select_ids.device_ptr(stream_ref);
             let (ctrs_devptr, _) = counters.device_ptr(stream_ref);
-            let (blkoffs_devptr, _) = block_offsets.device_ptr(stream_ref);
+            let (sorted_rw_devptr, _) = sorted_routing_weights.device_ptr(stream_ref);
+            let (inter_buf_devptr, _) = intermediate_buffer.device_ptr(stream_ref);
 
             unsafe {
-                ffi::fused_moe_auto(
+                ffi::fused_moe(
                     input_ptr,
                     gate_ptr,
                     up_ptr,
@@ -484,15 +489,16 @@ impl FusedMoE {
                     counts_devptr as usize as *mut core::ffi::c_int,
                     offsets_devptr as usize as *mut core::ffi::c_int,
                     tids_devptr as usize as *mut core::ffi::c_int,
-                    sids_devptr as usize as *mut core::ffi::c_int,
                     ctrs_devptr as usize as *mut core::ffi::c_int,
-                    blkoffs_devptr as usize as *mut core::ffi::c_int,
+                    sorted_rw_devptr as usize as *mut f32,
+                    inter_buf_devptr as usize as *mut f32,
+                    stream_ptr,
                 );
             }
         } else {
             // For small batches, use simple token-parallel kernel
             unsafe {
-                ffi::fused_moe(
+                ffi::moe_token_parallel(
                     input_ptr,
                     gate_ptr,
                     up_ptr,
@@ -507,6 +513,7 @@ impl FusedMoE {
                     self.activation.to_int(),
                     moe_type,
                     dtype,
+                    stream_ptr,
                 );
             }
         }

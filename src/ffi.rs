@@ -10,9 +10,10 @@ unsafe extern "C" {
         num_experts: c_int,
         num_tokens: c_int,
         topk: c_int,
+        stream: *mut c_void,
     );
 
-    pub(crate) fn fused_moe(
+    pub(crate) fn moe_token_parallel(
         input: *const c_void,
         gate_weights: *const c_void,
         up_weights: *const c_void,
@@ -27,9 +28,10 @@ unsafe extern "C" {
         activation_type: i32,
         moe_type: u32,
         dtype: u32,
+        stream: *mut c_void,
     );
 
-    pub(crate) fn fused_moe_auto(
+    pub(crate) fn fused_moe(
         input: *const c_void,
         gate_weights: *const c_void,
         up_weights: *const c_void,
@@ -49,8 +51,9 @@ unsafe extern "C" {
         expert_counts: *mut c_int,
         expert_offsets: *mut c_int,
         token_ids: *mut c_int,
-        select_ids: *mut c_int,
         counters: *mut c_int,
-        block_offsets: *mut c_int,
+        sorted_routing_weights: *mut f32,
+        intermediate_buffer: *mut f32,
+        stream: *mut c_void,
     );
 }

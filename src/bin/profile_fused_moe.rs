@@ -65,6 +65,13 @@ fn main() -> Result<()> {
         &device,
     )?
     .to_dtype(dtype)?;
+    let down_weights = Tensor::randn(
+        0.0,
+        1.0,
+        (num_experts, intermidiate_size, hidden_size),
+        &device,
+    )?
+    .to_dtype(dtype)?;
     let (scores, indices) = forward_moe_router(&weights, seq_len, top_k, &device)?;
 
     let fused_moe = candle_moe::FusedMoE {
@@ -73,28 +80,28 @@ fn main() -> Result<()> {
         activation: candle_moe::Activation::Silu,
     };
 
+    // Warmup
     for _ in 0..iters {
         let _ = fused_moe.forward(
             &hidden_states,
             &gate_weights,
             &up_weights,
-            None,
+            Some(&down_weights),
             &scores,
             &indices,
-            1_u32,
+            0_u32, // Qwen3 MoE (with down projection) - uses expert kernel
         )?;
     }
     device.synchronize()?;
 
     println!(
-        "Profiling fused MoE: shape=({}, {}), num_experts={}, iters={}",
-        seq_len, hidden_size, num_experts, iters
+        "Profiling fused MoE: shape=({}, {}), num_experts={}, dtype={:?} iters={}",
+        seq_len, hidden_size, num_experts, dtype, iters
     );
 
     // --- Profiling region with NVTX range per call ---
     for _ in 0..iters {
         unsafe {
-            // This is exactly what you asked for:
             nvtxRangePushA(b"fused_moe_f16\0".as_ptr() as *const c_char);
         }
 
@@ -102,10 +109,10 @@ fn main() -> Result<()> {
             &hidden_states,
             &gate_weights,
             &up_weights,
-            None,
+            Some(&down_weights),
             &scores,
             &indices,
-            1_u32,
+            0_u32, // Qwen3 MoE (with down projection) - uses expert kernel
         )?;
 
         unsafe {

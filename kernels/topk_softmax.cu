@@ -475,14 +475,16 @@ void topkGatingSoftmaxKernelLauncher(
 extern "C" void topk_softmax(
     void *gating_output,               // [num_tokens, num_experts]
     void *topk_weights,                // [num_tokens, topk]
-    void *topk_indices,                // [num_tokens, topk]
-    void *token_expert_indices,        // [num_tokens, topk]
+    void *topk_indices,                 // [num_tokens, topk]
+    void *token_expert_indices,   // [num_tokens, topk]
 
     int32_t num_experts,
     int64_t num_tokens,
-    int32_t topk
+    int32_t topk,
+    void* stream_ptr
 ) {
-    const cudaStream_t stream = 0;
+    const cudaStream_t stream =
+        stream_ptr ? reinterpret_cast<cudaStream_t>(stream_ptr) : 0;
 
     vllm::moe::topkGatingSoftmaxKernelLauncher(
         reinterpret_cast<float*>(gating_output),
