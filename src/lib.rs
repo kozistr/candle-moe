@@ -257,17 +257,18 @@ impl FusedMoE {
     }
 
     /// Performs fused MoE forward pass
-    /// Args:
-    /// - input: [num_tokens, hidden_dim]
-    /// - gate_weights: [num_experts, hidden_dim, intermediate_dim]
-    /// - up_weights: [num_experts, hidden_dim, intermediate_dim]
-    /// - down_weights: [num_experts, intermediate_dim, hidden_dim]
-    /// - routing_weights: [num_tokens, num_selected_experts]
-    /// - expert_indices: [num_tokens, num_selected_experts]
-    /// - moe_type: qwen3: 0, nomic: 1
     ///
-    /// Returns:
-    /// - output tensor: [num_tokens, hidden_dim]
+    /// # Arguments
+    /// - `input`: [num_tokens, hidden_dim] - Input activations
+    /// - `gate_weights`: [num_experts, hidden_dim, intermediate_dim] - Gate projection weights
+    /// - `up_weights`: [num_experts, hidden_dim, intermediate_dim] - Up projection weights
+    /// - `down_weights`: [num_experts, intermediate_dim, hidden_dim] - Down projection (Qwen3 only)
+    /// - `routing_weights`: [num_tokens, num_selected_experts] - Routing weights (f32)
+    /// - `expert_indices`: [num_tokens, num_selected_experts] - Selected expert indices (u32)
+    /// - `moe_type`: 0 = Qwen3 (gate-up-down), 1 = Nomic (gate-up only)
+    ///
+    /// # Returns
+    /// - Output tensor: [num_tokens, hidden_dim]
     #[allow(clippy::too_many_arguments)]
     pub fn forward(
         &self,
@@ -446,76 +447,25 @@ impl FusedMoE {
 
         let dtype = fused_moe_internal_dtype(input.dtype())?;
 
-        // Use expert-parallel kernel for large batches (much faster due to weight reuse)
-        if num_tokens >= 16 {
-            // Allocate workspace buffers for expert-parallel processing
-            // All buffers are uninitialized - the CUDA kernel zeros them to avoid memset API overhead
-            let total_assignments = num_tokens * self.num_selected_experts;
-            let cuda_dev = input_cuda.device();
-
-            let expert_counts = unsafe { cuda_dev.alloc::<u32>(self.num_experts)? };
-            let counters = unsafe { cuda_dev.alloc::<u32>(self.num_experts)? };
-            let expert_offsets = unsafe { cuda_dev.alloc::<u32>(self.num_experts + 1)? };
-            let token_ids = unsafe { cuda_dev.alloc::<u32>(total_assignments)? };
-            let sorted_routing_weights = unsafe { cuda_dev.alloc::<f32>(total_assignments)? };
-            // Intermediate buffer stores act(gate) * up: [total_assignments, intermediate_dim]
-            let intermediate_buffer =
-                unsafe { cuda_dev.alloc::<f32>(total_assignments * intermediate_dim)? };
-
-            let (counts_devptr, _) = expert_counts.device_ptr(stream_ref);
-            let (offsets_devptr, _) = expert_offsets.device_ptr(stream_ref);
-            let (tids_devptr, _) = token_ids.device_ptr(stream_ref);
-            let (ctrs_devptr, _) = counters.device_ptr(stream_ref);
-            let (sorted_rw_devptr, _) = sorted_routing_weights.device_ptr(stream_ref);
-            let (inter_buf_devptr, _) = intermediate_buffer.device_ptr(stream_ref);
-
-            unsafe {
-                ffi::fused_moe(
-                    input_ptr,
-                    gate_ptr,
-                    up_ptr,
-                    down_ptr,
-                    routing_ptr,
-                    indices_ptr,
-                    output_ptr,
-                    num_tokens as i32,
-                    hidden_dim as i32,
-                    intermediate_dim as i32,
-                    self.num_experts as i32,
-                    self.num_selected_experts as i32,
-                    self.activation.to_int(),
-                    moe_type,
-                    dtype,
-                    counts_devptr as usize as *mut core::ffi::c_int,
-                    offsets_devptr as usize as *mut core::ffi::c_int,
-                    tids_devptr as usize as *mut core::ffi::c_int,
-                    ctrs_devptr as usize as *mut core::ffi::c_int,
-                    sorted_rw_devptr as usize as *mut f32,
-                    inter_buf_devptr as usize as *mut f32,
-                    stream_ptr,
-                );
-            }
-        } else {
-            // For small batches, use simple token-parallel kernel
-            unsafe {
-                ffi::moe_token_parallel(
-                    input_ptr,
-                    gate_ptr,
-                    up_ptr,
-                    down_ptr,
-                    routing_ptr,
-                    indices_ptr,
-                    output_ptr,
-                    num_tokens as i32,
-                    hidden_dim as i32,
-                    intermediate_dim as i32,
-                    self.num_selected_experts as i32,
-                    self.activation.to_int(),
-                    moe_type,
-                    dtype,
-                    stream_ptr,
-                );
-            }
+        unsafe {
+            ffi::fused_moe(
+                input_ptr,
+                gate_ptr,
+                up_ptr,
+                down_ptr,
+                routing_ptr,
+                indices_ptr,
+                output_ptr,
+                num_tokens as i32,
+                hidden_dim as i32,
+                intermediate_dim as i32,
+                self.num_experts as i32,
+                self.num_selected_experts as i32,
+                self.activation.to_int(),
+                moe_type,
+                dtype,
+                stream_ptr,
+            );
         }
 
         Ok(())

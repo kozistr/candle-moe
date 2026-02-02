@@ -401,7 +401,7 @@ struct TopkConstants
 
 template <int EXPERTS, int WARPS_PER_TB>
 void topkGatingSoftmaxLauncherHelper(const float* input, const bool* finished, float* output, int* indices,
-    int* source_row, const int num_rows, const int k, const int start_expert, const int end_expert, cudaStream_t stream)
+    int* source_row, const int64_t num_rows, const int k, const int start_expert, const int end_expert, cudaStream_t stream)
 {
     static constexpr std::size_t MAX_BYTES_PER_LDG = 16;
 
@@ -428,7 +428,7 @@ void topkGatingSoftmaxKernelLauncher(
     float* topk_weights,
     int* topk_indicies,
     int* token_expert_indices,
-    const int num_tokens,
+    const int64_t num_tokens,
     const int num_experts,
     const int topk,
     cudaStream_t stream

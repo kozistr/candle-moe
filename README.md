@@ -4,7 +4,7 @@ Fast CUDA `fused MoE` for [Candle](https://github.com/huggingface/candle) backen
 
 ## Requirements
 
-* SM 7.0+ (Volta+) GPU (e.g. A40)
+* SM 7.0+ (Volta+) GPU
 * `Candle 0.9+`
 
 ## Benchmark
@@ -24,19 +24,22 @@ vs `candle 0.9.1` native kernels / `fused MoE kernel`
 
 | moe type |   fp  | seq_len | hidden_dim | num_experts | top k | candle 0.9 | candle-moe | speed-up |
 |   :---:  | :---: |  :---:  | :---:      | :---:       | :---: | :---:      | :---:      | :---:    |
-| nomic    | f32   | 32      | 768        | 8           | 2     | 1.350 ms   | 185.830 µs | 7.27x    |
-| nomic    | f32   | 512     | 768        | 8           | 2     | 1.823 ms   | 363.393 µs | 5.02x    |
-| nomic    | f32   | 8192    | 768        | 8           | 2     | 11.645 ms  | 10.513 ms  | 1.11x    |
-| nomic    | f32   | 32768   | 768        | 8           | 2     | 47.415 ms  | 39.503 ms  | 1.20x    |
-| nomic    | f16   | 32      | 768        | 8           | 2     | 1.574 ms   | 775.599 µs | 2.03x    |
-| nomic    | f16   | 8192    | 768        | 8           | 2     | 9.492 ms   | 3.883 ms   | 2.44x    |
-| nomic    | f16   | 32768   | 768        | 8           | 2     | 41.201 ms  | 14.279 ms  | 2.89x    |
-| qwen3    | f32   | 32      | 768        | 8           | 2     | 1.455 ms   | 214.840 µs | 6.77x    |
-| qwen3    | f32   | 512     | 768        | 8           | 2     | 1.665 ms   | 489.990 µs | 3.40x    |
-| qwen3    | f32   | 8192    | 768        | 8           | 2     | 12.479 ms  | 13.355 ms  | 0.93x    |
-| qwen3    | f32   | 32768   | 768        | 8           | 2     | 48.655 ms  | 50.697 ms  | 0.96x    |
-| qwen3    | f16   | 8192    | 768        | 8           | 2     | 10.592 ms  | 3.831 ms   | 2.76x    |
-| qwen3    | f16   | 32768   | 768        | 8           | 2     | 40.856 ms  | 14.702 ms  | 2.78x    |
+| nomic    | f32   | 32      | 768        | 8           | 2     | 1.350 ms   | 628.0 µs   | 2.15x    |
+| nomic    | f32   | 512     | 768        | 8           | 2     | 1.823 ms   | 1.183 ms   | 1.54x    |
+| nomic    | f32   | 8192    | 768        | 8           | 2     | 11.645 ms  | 11.88 ms   | 0.98x    |
+| nomic    | f32   | 32768   | 768        | 8           | 2     | 43.338 ms  | 14.07 ms   | 3.08x    |
+| nomic    | f16   | 8192    | 768        | 8           | 2     | 9.492 ms   | 1.97 ms    | 4.81x    |
+| nomic    | f16   | 32768   | 768        | 8           | 2     | 41.201 ms  | 8.58 ms    | 4.80x    |
+| qwen3    | f32   | 32      | 768        | 8           | 2     | 1.455 ms   | 677.0 µs   | 2.15x    |
+| qwen3    | f32   | 512     | 768        | 8           | 2     | 1.665 ms   | 1.081 ms   | 1.54x    |
+| qwen3    | f32   | 8192    | 768        | 8           | 2     | 12.479 ms  | 12.73 ms   | 0.98x    |
+| qwen3    | f32   | 32768   | 768        | 8           | 2     | 48.655 ms  | 15.80 ms   | 3.08x    |
+| qwen3    | f16   | 8192    | 768        | 8           | 2     | 10.592 ms  | 2.20 ms    | 4.81x    |
+| qwen3    | f16   | 32768   | 768        | 8           | 2     | 40.856 ms  | 8.51 ms    | 4.80x    |
+| qwen3    | f16   | 32      | 4096       | 8           | 2     | 7.301 ms   | 8.617 ms   | 0.85x    |
+| qwen3    | f16   | 32768   | 4096       | 8           | 2     | 358.608 ms | 57.957 ms  | 6.19x    |
+| qwen3    | bf16  | 32      | 4096       | 8           | 2     | 7.313 ms   | 8.840 ms   | 0.83x    |
+| qwen3    | bf16  | 32768   | 4096       | 8           | 2     | 362.916 ms | 57.727 ms  | 6.29x    |
 
 Benchmarks run on A40 GPU
 
@@ -62,7 +65,7 @@ candle_moe::apply_topk_softmax_inplace(
     &token_expert_indices,
 )?;
 
-... 
+...
 
 let num_experts = 32;
 let top_k = 2;

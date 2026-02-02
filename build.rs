@@ -4,12 +4,22 @@
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 
-const KERNEL_FILES: [&str; 2] = ["kernels/topk_softmax.cu", "kernels/fused_moe.cu"];
+const KERNEL_FILES: [&str; 4] = [
+    "kernels/topk_softmax.cu",
+    "kernels/fused_moe.cu",
+    "kernels/qwen3_moe.cu",
+    "kernels/nomic_moe.cu",
+];
+
+const HEADER_FILES: [&str; 2] = ["kernels/common.cuh", "kernels/preprocessing.cuh"];
 
 fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=build.rs");
     for kernel_file in KERNEL_FILES.iter() {
         println!("cargo:rerun-if-changed={kernel_file}");
+    }
+    for header_file in HEADER_FILES.iter() {
+        println!("cargo:rerun-if-changed={header_file}");
     }
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").context("OUT_DIR not set")?);
@@ -33,7 +43,7 @@ fn main() -> Result<()> {
     };
 
     let kernels: Vec<_> = KERNEL_FILES.iter().collect();
-    let builder = bindgen_cuda::Builder::default()
+    let mut builder = bindgen_cuda::Builder::default()
         .kernel_paths(kernels)
         .out_dir(build_dir.clone())
         .arg("-std=c++17")
@@ -49,6 +59,16 @@ fn main() -> Result<()> {
         .arg("--use_fast_math")
         .arg("--ptxas-options=-v")
         .arg("--verbose");
+
+    // Disable BF16 kernels for SM < 80 (pre-Ampere GPUs)
+    // BF16 WMMA and certain BF16 intrinsics require SM 80+
+    if let Ok(compute_cap) = std::env::var("CUDA_COMPUTE_CAP")
+        && let Ok(cap) = compute_cap.parse::<u32>()
+        && cap < 80
+    {
+        println!("cargo:warning=CUDA compute capability {cap} < 80, disabling BF16 kernels");
+        builder = builder.arg("-DNO_BF16_KERNEL");
+    }
 
     let target = std::env::var("TARGET").unwrap();
 

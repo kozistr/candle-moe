@@ -1,0 +1,420 @@
+diff --git a/kernels/fused_moe.cu b/kernels/fused_moe.cu
+index 2dd3730..657d40e 100644
+--- a/kernels/fused_moe.cu
++++ b/kernels/fused_moe.cu
+@@ -37,6 +37,7 @@ extern "C" void qwen3_moe_forward(
+     int intermediate_dim,
+     int num_experts,
+     int max_tokens_per_expert,
++    int top_k,
+     int activation_type,
+     cudaStream_t stream
+ );
+@@ -55,13 +56,92 @@ extern "C" void nomic_moe_forward(
+     int intermediate_dim,
+     int num_experts,
+     int max_tokens_per_expert,
++    int top_k,
+     int activation_type,
+     cudaStream_t stream
+ );
+
++// BF16 kernel forward declarations
++extern "C" void qwen3_moe_forward_bf16(
++    const __nv_bfloat16* input,
++    const __nv_bfloat16* gate_weights,
++    const __nv_bfloat16* up_weights,
++    const __nv_bfloat16* down_weights,
++    const int* sorted_token_ids,
++    const float* sorted_weights,
++    const int* expert_offsets,
++    __nv_bfloat16* intermediate,
++    __nv_bfloat16* output,
++    int num_tokens,
++    int hidden_dim,
++    int intermediate_dim,
++    int num_experts,
++    int max_tokens_per_expert,
++    int top_k,
++    int activation_type,
++    cudaStream_t stream
++);
++
++extern "C" void nomic_moe_forward_bf16(
++    const __nv_bfloat16* input,
++    const __nv_bfloat16* gate_weights,
++    const __nv_bfloat16* up_weights,
++    const int* sorted_token_ids,
++    const float* sorted_weights,
++    const int* expert_offsets,
++    __nv_bfloat16* intermediate,
++    __nv_bfloat16* output,
++    int num_tokens,
++    int hidden_dim,
++    int intermediate_dim,
++    int num_experts,
++    int max_tokens_per_expert,
++    int top_k,
++    int activation_type,
++    cudaStream_t stream
++);
++
++// ============================================================================
++// BF16 Conversion Kernels
++// ============================================================================
++
++__global__ void convert_bf16_to_f32_kernel(
++    const __nv_bfloat16* __restrict__ input,
++    float* __restrict__ output,
++    size_t n
++) {
++    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    if (idx < n) {
++        output[idx] = __bfloat162float(input[idx]);
++    }
++}
++
++__global__ void convert_f32_to_bf16_kernel(
++    const float* __restrict__ input,
++    __nv_bfloat16* __restrict__ output,
++    size_t n
++) {
++    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    if (idx < n) {
++        output[idx] = __float2bfloat16(input[idx]);
++    }
++}
++
++void launch_bf16_to_f32(const __nv_bfloat16* input, float* output, size_t n, cudaStream_t stream) {
++    int threads = 256;
++    int blocks = (n + threads - 1) / threads;
++    convert_bf16_to_f32_kernel<<<blocks, threads, 0, stream>>>(input, output, n);
++}
++
++void launch_f32_to_bf16(const float* input, __nv_bfloat16* output, size_t n, cudaStream_t stream) {
++    int threads = 256;
++    int blocks = (n + threads - 1) / threads;
++    convert_f32_to_bf16_kernel<<<blocks, threads, 0, stream>>>(input, output, n);
++}
++
+ // ============================================================================
+ // FP32 Fallback Kernels - Optimized with larger tiles
+-// For when tensor cores are not available or FP32 is required
++// For when tensor cores are not available or FP32/BF16 is required
+ // ============================================================================
+
+ namespace fp32_config {
+@@ -221,7 +301,8 @@ moe_down_f32_kernel(
+     float* __restrict__ output,
+     int hidden_dim,
+     int intermediate_dim,
+-    bool is_transposed
++    bool is_transposed,
++    int top_k
+ ) {
+     using namespace fp32_config;
+
+@@ -336,7 +417,13 @@ moe_down_f32_kernel(
+                 int global_n = block_n + thread_n * THREAD_N + ni;
+                 if (global_n < hidden_dim) {
+                     float val = acc[mi][ni] * weight;
+-                    atomicAdd(&output[token_id * hidden_dim + global_n], val);
++                    if (top_k == 1) {
++                        // Single expert per token - direct store, no atomicAdd needed
++                        output[token_id * hidden_dim + global_n] = val;
++                    } else {
++                        // Multiple experts per token - need atomic accumulation
++                        atomicAdd(&output[token_id * hidden_dim + global_n], val);
++                    }
+                 }
+             }
+         }
+@@ -357,7 +444,7 @@ extern "C" {
+  * - moe_type=1 (Nomic): act(x @ gate) @ up.T -> [seq, hidden]
+  *
+  * - dtype=0 (FP16): Tensor core accelerated
+- * - dtype=1 (BF16): Tensor core accelerated (SM80+)
++ * - dtype=1 (BF16): Uses FP32 computation with BF16 I/O conversion
+  * - dtype=2 (FP32): FP32 fallback
+  */
+ void fused_moe(
+@@ -381,17 +468,23 @@ void fused_moe(
+     cudaStream_t stream = stream_ptr ? reinterpret_cast<cudaStream_t>(stream_ptr) : 0;
+
+     const bool is_qwen3 = (moe_type == 0);
++    const bool is_fp16 = (dtype == 0);
++    const bool is_bf16 = (dtype == 1);
+     const bool is_fp32 = (dtype == 2);
++    const bool use_fp32_compute = is_fp32;  // Only FP32 uses FP32 compute path now
+     const int total = num_tokens * num_selected_experts;
+
+     // Calculate workspace sizes
+-    size_t elem_size = is_fp32 ? sizeof(float) : sizeof(half);
++    // BF16 and FP16 use same element size (2 bytes), FP32 uses 4 bytes
++    size_t compute_elem_size = is_fp32 ? sizeof(float) : sizeof(half);
+     size_t align = 256;
+
+-    size_t offset_size = ((num_experts + 1) * sizeof(int) + align - 1) & ~(align - 1);
++    // expert_offsets needs num_experts + 2 slots:
++    // [0..num_experts] = cumulative offsets, [num_experts + 1] = max_tokens_per_expert
++    size_t offset_size = ((num_experts + 2) * sizeof(int) + align - 1) & ~(align - 1);
+     size_t sorted_ids_size = (total * sizeof(int) + align - 1) & ~(align - 1);
+     size_t sorted_weights_size = (total * sizeof(float) + align - 1) & ~(align - 1);
+-    size_t intermediate_size = ((size_t)total * intermediate_dim * elem_size + align - 1) & ~(align - 1);
++    size_t intermediate_size = ((size_t)total * intermediate_dim * compute_elem_size + align - 1) & ~(align - 1);
+
+     size_t total_workspace = offset_size + sorted_ids_size + sorted_weights_size + intermediate_size;
+
+@@ -399,12 +492,20 @@ void fused_moe(
+     char* d_workspace;
+     cudaMallocAsync(&d_workspace, total_workspace, stream);
+
+-    int* d_expert_offsets = reinterpret_cast<int*>(d_workspace);
+-    int* d_sorted_token_ids = reinterpret_cast<int*>(d_workspace + offset_size);
+-    float* d_sorted_weights = reinterpret_cast<float*>(d_workspace + offset_size + sorted_ids_size);
+-    void* d_intermediate = reinterpret_cast<void*>(d_workspace + offset_size + sorted_ids_size + sorted_weights_size);
++    size_t ws_offset = 0;
++    int* d_expert_offsets = reinterpret_cast<int*>(d_workspace + ws_offset);
++    ws_offset += offset_size;
+
+-    // Run preprocessing
++    int* d_sorted_token_ids = reinterpret_cast<int*>(d_workspace + ws_offset);
++    ws_offset += sorted_ids_size;
++
++    float* d_sorted_weights = reinterpret_cast<float*>(d_workspace + ws_offset);
++    ws_offset += sorted_weights_size;
++
++    void* d_intermediate = reinterpret_cast<void*>(d_workspace + ws_offset);
++    ws_offset += intermediate_size;
++
++    // Run preprocessing (also computes max_tokens_per_expert)
+     launch_preprocessing(
+         reinterpret_cast<const uint32_t*>(expert_indices),
+         reinterpret_cast<const float*>(routing_weights),
+@@ -417,14 +518,119 @@ void fused_moe(
+         stream
+     );
+
+-    // Estimate max tokens per expert for kernel selection
+-    // Use a heuristic: assume roughly uniform distribution with 2x headroom for imbalance
+-    int avg_per_expert = (total + num_experts - 1) / num_experts;
+-    int max_tokens_per_expert = min(total, avg_per_expert * 2);
++    // Determine max_tokens_per_expert for kernel grid sizing.
++    // Use total as upper bound when it fits in grid.y (guaranteed correct, no sync).
++    // For very large batches, sync to get exact value to avoid grid overflow.
++    int max_tokens_per_expert;
++    // CUDA grid.y limit is 65535. GEMM kernels use tiles so effective limit is higher.
++    // For GEMV (seq <= 8): grid.y = max_tokens_per_expert directly
++    // For GEMM: grid.y = ceil(max_tokens_per_expert / BLOCK_M), BLOCK_M >= 32
++    // Use conservative limit for GEMV path compatibility.
++    const int grid_y_limit = 32768;
++
++    if (total <= grid_y_limit) {
++        // Use total as upper bound - guaranteed correct, no sync needed
++        max_tokens_per_expert = total;
++    } else {
++        // For large batches, sync to get exact value
++        cudaMemcpyAsync(&max_tokens_per_expert, &d_expert_offsets[num_experts + 1],
++                       sizeof(int), cudaMemcpyDeviceToHost, stream);
++        cudaStreamSynchronize(stream);
++        max_tokens_per_expert = max(1, max_tokens_per_expert);
++    }
+
+-    if (is_fp32) {
++    if (is_fp16) {
++        // FP16 path - use tensor core optimized kernels
++        if (is_qwen3) {
++            qwen3_moe_forward(
++                reinterpret_cast<const half*>(input),
++                reinterpret_cast<const half*>(gate_weights),
++                reinterpret_cast<const half*>(up_weights),
++                reinterpret_cast<const half*>(down_weights),
++                d_sorted_token_ids,
++                d_sorted_weights,
++                d_expert_offsets,
++                reinterpret_cast<half*>(d_intermediate),
++                reinterpret_cast<half*>(output),
++                num_tokens,
++                hidden_dim,
++                intermediate_dim,
++                num_experts,
++                max_tokens_per_expert,
++                num_selected_experts,  // top_k
++                activation_type,
++                stream
++            );
++        } else {
++            nomic_moe_forward(
++                reinterpret_cast<const half*>(input),
++                reinterpret_cast<const half*>(gate_weights),
++                reinterpret_cast<const half*>(up_weights),
++                d_sorted_token_ids,
++                d_sorted_weights,
++                d_expert_offsets,
++                reinterpret_cast<half*>(d_intermediate),
++                reinterpret_cast<half*>(output),
++                num_tokens,
++                hidden_dim,
++                intermediate_dim,
++                num_experts,
++                max_tokens_per_expert,
++                num_selected_experts,  // top_k
++                activation_type,
++                stream
++            );
++        }
++    } else if (is_bf16) {
++        // BF16 path - use native BF16 tensor core kernels (SM80+)
++        if (is_qwen3) {
++            qwen3_moe_forward_bf16(
++                reinterpret_cast<const __nv_bfloat16*>(input),
++                reinterpret_cast<const __nv_bfloat16*>(gate_weights),
++                reinterpret_cast<const __nv_bfloat16*>(up_weights),
++                reinterpret_cast<const __nv_bfloat16*>(down_weights),
++                d_sorted_token_ids,
++                d_sorted_weights,
++                d_expert_offsets,
++                reinterpret_cast<__nv_bfloat16*>(d_intermediate),
++                reinterpret_cast<__nv_bfloat16*>(output),
++                num_tokens,
++                hidden_dim,
++                intermediate_dim,
++                num_experts,
++                max_tokens_per_expert,
++                num_selected_experts,  // top_k
++                activation_type,
++                stream
++            );
++        } else {
++            nomic_moe_forward_bf16(
++                reinterpret_cast<const __nv_bfloat16*>(input),
++                reinterpret_cast<const __nv_bfloat16*>(gate_weights),
++                reinterpret_cast<const __nv_bfloat16*>(up_weights),
++                d_sorted_token_ids,
++                d_sorted_weights,
++                d_expert_offsets,
++                reinterpret_cast<__nv_bfloat16*>(d_intermediate),
++                reinterpret_cast<__nv_bfloat16*>(output),
++                num_tokens,
++                hidden_dim,
++                intermediate_dim,
++                num_experts,
++                max_tokens_per_expert,
++                num_selected_experts,  // top_k
++                activation_type,
++                stream
++            );
++        }
++    } else {
+         // FP32 path - optimized with larger tiles
+         using namespace fp32_config;
++        const float* compute_input = reinterpret_cast<const float*>(input);
++        const float* compute_gate = reinterpret_cast<const float*>(gate_weights);
++        const float* compute_up = reinterpret_cast<const float*>(up_weights);
++        const float* compute_down = reinterpret_cast<const float*>(down_weights);
++        float* compute_output = reinterpret_cast<float*>(output);
+
+         int m_tiles = (max_tokens_per_expert + BLOCK_M - 1) / BLOCK_M;
+         int n_tiles_inter = (intermediate_dim + BLOCK_N - 1) / BLOCK_N;
+@@ -438,9 +644,9 @@ void fused_moe(
+             // Qwen3: gate-up fused, then down
+             dim3 grid_gate_up(n_tiles_inter, m_tiles, num_experts);
+             moe_gate_up_f32_kernel<<<grid_gate_up, THREADS, gate_up_smem, stream>>>(
+-                reinterpret_cast<const float*>(input),
+-                reinterpret_cast<const float*>(gate_weights),
+-                reinterpret_cast<const float*>(up_weights),
++                compute_input,
++                compute_gate,
++                compute_up,
+                 d_sorted_token_ids,
+                 d_expert_offsets,
+                 reinterpret_cast<float*>(d_intermediate),
+@@ -453,14 +659,15 @@ void fused_moe(
+             dim3 grid_down(n_tiles_out, m_tiles, num_experts);
+             moe_down_f32_kernel<<<grid_down, THREADS, down_smem, stream>>>(
+                 reinterpret_cast<const float*>(d_intermediate),
+-                reinterpret_cast<const float*>(down_weights),
++                compute_down,
+                 d_sorted_token_ids,
+                 d_sorted_weights,
+                 d_expert_offsets,
+-                reinterpret_cast<float*>(output),
++                compute_output,
+                 hidden_dim,
+                 intermediate_dim,
+-                false  // not transposed
++                false,  // not transposed
++                num_selected_experts  // top_k
+             );
+         } else {
+             // Nomic: gate only, then up.T
+@@ -468,8 +675,8 @@ void fused_moe(
+
+             dim3 grid_gate(n_tiles_inter, m_tiles, num_experts);
+             moe_gate_up_f32_kernel<<<grid_gate, THREADS, gate_only_smem, stream>>>(
+-                reinterpret_cast<const float*>(input),
+-                reinterpret_cast<const float*>(gate_weights),
++                compute_input,
++                compute_gate,
+                 nullptr,
+                 d_sorted_token_ids,
+                 d_expert_offsets,
+@@ -483,54 +690,15 @@ void fused_moe(
+             dim3 grid_up(n_tiles_out, m_tiles, num_experts);
+             moe_down_f32_kernel<<<grid_up, THREADS, down_smem, stream>>>(
+                 reinterpret_cast<const float*>(d_intermediate),
+-                reinterpret_cast<const float*>(up_weights),
++                compute_up,
+                 d_sorted_token_ids,
+                 d_sorted_weights,
+                 d_expert_offsets,
+-                reinterpret_cast<float*>(output),
++                compute_output,
+                 hidden_dim,
+                 intermediate_dim,
+-                true  // transposed
+-            );
+-        }
+-    } else {
+-        // FP16/BF16 path - use optimized kernels
+-        if (is_qwen3) {
+-            qwen3_moe_forward(
+-                reinterpret_cast<const half*>(input),
+-                reinterpret_cast<const half*>(gate_weights),
+-                reinterpret_cast<const half*>(up_weights),
+-                reinterpret_cast<const half*>(down_weights),
+-                d_sorted_token_ids,
+-                d_sorted_weights,
+-                d_expert_offsets,
+-                reinterpret_cast<half*>(d_intermediate),
+-                reinterpret_cast<half*>(output),
+-                num_tokens,
+-                hidden_dim,
+-                intermediate_dim,
+-                num_experts,
+-                max_tokens_per_expert,
+-                activation_type,
+-                stream
+-            );
+-        } else {
+-            nomic_moe_forward(
+-                reinterpret_cast<const half*>(input),
+-                reinterpret_cast<const half*>(gate_weights),
+-                reinterpret_cast<const half*>(up_weights),
+-                d_sorted_token_ids,
+-                d_sorted_weights,
+-                d_expert_offsets,
+-                reinterpret_cast<half*>(d_intermediate),
+-                reinterpret_cast<half*>(output),
+-                num_tokens,
+-                hidden_dim,
+-                intermediate_dim,
+-                num_experts,
+-                max_tokens_per_expert,
+-                activation_type,
+-                stream
++                true,  // transposed
++                num_selected_experts  // top_k
+             );
+         }
+     }
